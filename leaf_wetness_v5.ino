@@ -86,8 +86,17 @@ const float WET_OFF_PERCENT        = 1.5f;     // at or below: leaf becomes dry
 const float FILM_UPPER_PERCENT     = 20.0f;    // below this: thin film / dew
 const float WET_UPPER_PERCENT      = 75.0f;    // below this: wet; above: drenched
 
+// ---- Rain detection ----
+// Rain shows up two ways in real logs: a fast climb when the leaf first gets
+// soaked, and then constant jitter as drops land and run off (steps of 0.5 % or
+// more every few samples). A dry or merely damp sensor changes by 0.2 % or less
+// per sample, so counting big steps separates rain from dew and slow drying.
+const float    RAIN_MIN_RISE_PERCENT = 5.0f;   // rise within RISE_WINDOW that means rain
+const float    RAIN_STEP_PERCENT     = 0.5f;   // one sample-to-sample change this big is a "drop"
+const int      RAIN_MIN_BIG_STEPS    = 3;      // this many drops within RISE_WINDOW means rain
+const uint32_t RAIN_HOLD_MS          = 300000; // rain counts as ongoing this long after the last drop
+
 // ---- Wet-source detection ----
-const float RAIN_MIN_RISE_PERCENT  = 13.0f;    // rise within RISE_WINDOW that means rain
 const float DEW_MAX_DEPRESSION_C   = 1.5f;     // air this close to dew point => dew likely
 const float FROST_BELOW_C          = 1.0f;     // ice can read as "dry" below this
 
@@ -100,6 +109,7 @@ struct LeafReading {
   float volts;
   float percent;         // 0 = dry calibration point, 100 = wet calibration point
   float risePercent;     // change since RISE_WINDOW_MS ago
+  int   bigSteps;        // sample-to-sample jumps of RAIN_STEP_PERCENT or more within RISE_WINDOW_MS
 };
 
 struct AirReading {
@@ -119,7 +129,7 @@ enum WetSource { SOURCE_NONE, SOURCE_RAIN, SOURCE_DEW, SOURCE_UNKNOWN };
 
 struct WetnessState {
   bool      isWet         = false;
-  bool      rainLike      = false;   // current wet period started or surged fast
+  bool      rainOngoing   = false;   // rain activity seen within RAIN_HOLD_MS
   bool      everWet       = false;
   bool      everRained    = false;
   WetSource source        = SOURCE_NONE;
@@ -254,11 +264,24 @@ float recordReadingAndGetRise(float percent) {
   return rise;
 }
 
+// Counts how many sample-to-sample changes in the history were big (drops landing).
+// Call after recordReadingAndGetRise(): the oldest reading is then at oldestReadingIndex.
+int countBigSteps() {
+  int count = 0;
+  for (int i = 0; i < RISE_WINDOW_SAMPLES - 1; i++) {
+    float older = recentPercent[(oldestReadingIndex + i)     % RISE_WINDOW_SAMPLES];
+    float newer = recentPercent[(oldestReadingIndex + i + 1) % RISE_WINDOW_SAMPLES];
+    if (fabs(newer - older) >= RAIN_STEP_PERCENT) count++;
+  }
+  return count;
+}
+
 LeafReading readLeaf() {
   LeafReading leaf;
   leaf.volts       = readLeafVolts();
   leaf.percent     = voltsToPercent(leaf.volts);
   leaf.risePercent = recordReadingAndGetRise(leaf.percent);
+  leaf.bigSteps    = countBigSteps();
   return leaf;
 }
 
@@ -293,10 +316,15 @@ UtcTime readUtcTime() {
 //  Wetness tracking
 // =============================================================================
 
+// Rain = a fast climb, or a burst of drops landing. Slow dew or drying never qualifies.
+bool looksLikeRain(const LeafReading& leaf) {
+  return leaf.risePercent >= RAIN_MIN_RISE_PERCENT || leaf.bigSteps >= RAIN_MIN_BIG_STEPS;
+}
+
 // Guesses why the leaf became wet, using how fast it rose and how close the air
 // is to its dew point.
 WetSource guessWetSource(const LeafReading& leaf, const AirReading& air) {
-  if (leaf.risePercent >= RAIN_MIN_RISE_PERCENT)                  return SOURCE_RAIN;
+  if (looksLikeRain(leaf))                                        return SOURCE_RAIN;
   if (air.valid && air.dewDepressionC < DEW_MAX_DEPRESSION_C)     return SOURCE_DEW;
   return SOURCE_UNKNOWN;
 }
@@ -304,14 +332,12 @@ WetSource guessWetSource(const LeafReading& leaf, const AirReading& air) {
 void startWetPeriod(WetnessState& w, const LeafReading& leaf, const AirReading& air, uint32_t nowMs) {
   w.isWet      = true;
   w.everWet    = true;
-  w.rainLike   = false;
   w.wetStartMs = nowMs;
   w.source     = guessWetSource(leaf, air);
 }
 
 void endWetPeriod(WetnessState& w, uint32_t nowMs) {
   w.isWet       = false;
-  w.rainLike    = false;
   w.source      = SOURCE_NONE;
   w.lastDryMs   = nowMs;
   w.totalWetMs += nowMs - w.wetStartMs;
@@ -325,17 +351,17 @@ void updateWetness(WetnessState& w, const LeafReading& leaf, const AirReading& a
     endWetPeriod(w, nowMs);
   }
 
-  // 2. A fast rise while wet means rain (or irrigation), even on an already wet leaf.
-  if (w.isWet && leaf.risePercent >= RAIN_MIN_RISE_PERCENT) {
-    w.rainLike   = true;
+  // 2. Rain (or irrigation) activity while wet, even on an already wet leaf.
+  //    Every sample with activity restarts the "time since rain" clock.
+  if (w.isWet && looksLikeRain(leaf)) {
     w.everRained = true;
+    w.lastRainMs = nowMs;
     w.source     = SOURCE_RAIN;
   }
 
-  // 3. While rain-like wetness continues, "time since rain" stays at zero.
-  if (w.isWet && w.rainLike) {
-    w.lastRainMs = nowMs;
-  }
+  // 3. Rain stays "ongoing" for a few minutes after the last drop, so gaps between
+  //    drops don't flicker it off. Dry spells then count up from the last drop.
+  w.rainOngoing = w.everRained && (nowMs - w.lastRainMs) < RAIN_HOLD_MS;
 }
 
 Durations computeDurations(const WetnessState& w, uint32_t nowMs) {
@@ -451,7 +477,7 @@ void drawDisplay(const LeafReading& leaf, const AirReading& air, const UtcTime& 
   // Row 4: time since rain
   if (!w.everRained) {
     snprintf(text, sizeof text, "Rain: none seen");
-  } else if (w.isWet && w.rainLike) {
+  } else if (w.rainOngoing) {
     snprintf(text, sizeof text, "Rain: ongoing");
   } else {
     formatDuration(d.sinceRain, duration, sizeof duration);

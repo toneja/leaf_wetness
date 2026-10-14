@@ -6,7 +6,7 @@ A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, 
 
 - 16-bit leaf wetness measurement through an Adafruit ADS1115, converted to a calibrated 0-100 % wetness value
 - Wet/dry detection with hysteresis (no flicker from sensor noise)
-- Wet-source guess: **RAIN** (fast rise), **DEW** (slow rise, air near dew point), or **WET** (unknown)
+- Wet-source guess: **RAIN** (fast rise or drops landing), **DEW** (slow rise, air near dew point), or **WET** (unknown)
 - Wet duration, dry duration, time since last rain, and cumulative wet time
 - Air temperature, humidity, dew point and dew point depression from a BME680
 - Frost flag, because ice on the sensor reads as nearly dry
@@ -81,7 +81,10 @@ All tunables are at the top of the sketch.
 | `WET_OFF_PERCENT` | 1.5 | Leaf becomes dry at or below this |
 | `FILM_UPPER_PERCENT` | 20.0 | Upper edge of the `FILM` class |
 | `WET_UPPER_PERCENT` | 75.0 | Upper edge of the `WET` class |
-| `RAIN_MIN_RISE_PERCENT` | 13.0 | Rise within the window that counts as rain |
+| `RAIN_MIN_RISE_PERCENT` | 5.0 | Rise within the window that counts as rain |
+| `RAIN_STEP_PERCENT` | 0.5 | A sample-to-sample change this big counts as a landing drop |
+| `RAIN_MIN_BIG_STEPS` | 3 | Drops within the window needed to call it rain |
+| `RAIN_HOLD_MS` | 300000 | Rain stays "ongoing" this long after the last drop |
 | `DEW_MAX_DEPRESSION_C` | 1.5 | Air this close to its dew point makes dew plausible |
 | `FROST_BELOW_C` | 1.0 | Air below this raises the frost flag |
 | `BLE_DEVICE_NAME` | `PHYTOS31 LOGGER` | Bluetooth advertising name |
@@ -106,11 +109,15 @@ The leaf is **wet** once `wet_pct` reaches `WET_ON_PERCENT` and **dry** again on
 
 When a wet period begins, the sketch guesses its source:
 
-1. Rise of `RAIN_MIN_RISE_PERCENT` or more in the last minute: **RAIN**
+1. Rise of `RAIN_MIN_RISE_PERCENT` or more in the last minute, or at least `RAIN_MIN_BIG_STEPS` sample-to-sample jumps of `RAIN_STEP_PERCENT` or more in the last minute: **RAIN**
 2. Otherwise, air temperature within `DEW_MAX_DEPRESSION_C` of the dew point: **DEW**
 3. Otherwise: **WET** (unknown, e.g. fog, irrigation, drizzle, or no air sensor)
 
-If a fast rise happens later in a wet period (rain on an already dewy leaf), the source is upgraded to **RAIN**. While rain-like wetness continues, "time since rain" stays at zero.
+If rain activity happens later in a wet period (rain on an already dewy leaf), the source is upgraded to **RAIN**.
+
+**Why drop activity, not just rise:** in a real logged rain (WET0002), the leaf climbed only to about 25-40 % and never rose faster than about 8 %/min, so a rise-only rule at 13 % missed every event. What gave rain away was constant jitter: steps of 0.5 % or more every few samples as drops land and run off. A damp or drying sensor changes by 0.2 % or less per sample, so counting big steps separates rain from dew and slow drying.
+
+Every sample with rain activity restarts the "time since rain" clock. Rain counts as **ongoing** until `RAIN_HOLD_MS` after the last drop, then `since_rain_s` counts up from that last drop. Thresholds come from one log, so check them against your own rain data.
 
 This is a heuristic from one leaf sensor plus air conditions. It cannot distinguish every case (see Limitations).
 
@@ -174,7 +181,7 @@ No GPS fix yet (date and time are empty):
 | 9 | `source` | text | Guessed cause of the current wet period: `RAIN`, `DEW`, `WET` (unknown), or `-` when dry. |
 | 10 | `wet_dur_s` | s | Length of the current wet period. 0 when dry. |
 | 11 | `since_wet_s` | s | Time since the last wet period ended. 0 while wet or if the leaf has never been wet since boot. |
-| 12 | `since_rain_s` | s | Time since the last rain-like event ended. 0 while rain-like wetness continues or if none has been seen since boot. |
+| 12 | `since_rain_s` | s | Time since the last rain activity (last drop or fast rise). Counts up from 0 during rain, so it stays under 300 while rain is ongoing; 0 also means none has been seen since boot. |
 | 13 | `wet_total_s` | s | Total wet time since boot, including the current wet period. |
 | 14 | `temp_c` | degC | Air temperature from the BME680. `nan` if the sensor is missing. |
 | 15 | `rh_pct` | %RH | Relative humidity. `nan` if the sensor is missing. |
@@ -185,8 +192,8 @@ No GPS fix yet (date and time are empty):
 ### Reading the columns together
 
 - **`class` vs `wet`:** `wet` has hysteresis and `class` does not, so a reading between 1.5 and 3 % can be class `FILM` while `wet` is still 0. `wet` is the one to use for durations.
-- **Zeros are ambiguous.** `since_wet_s = 0` means "currently wet" or "never wet"; `since_rain_s = 0` means "raining now" or "no rain seen". Check `wet` and `source` to tell which.
-- **Dew vs rain at night:** `source=DEW` with a small `depr_c` and a gentle `rise_pct_min` is dew. A fast `rise_pct_min` flips it to `RAIN` regardless of `depr_c`.
+- **Zeros are ambiguous.** `since_wet_s = 0` means "currently wet" or "never wet"; `since_rain_s = 0` means "rain just now" or "no rain seen". Check `source` to tell which.
+- **Dew vs rain at night:** `source=DEW` with a small `depr_c` and a gentle `rise_pct_min` is dew. A fast `rise_pct_min`, or jittery `wet_pct` readings, flip it to `RAIN` regardless of `depr_c`.
 - **Frozen sensor:** `frost=1` with a low `wet_pct` does not mean a dry leaf.
 - **Disease models** need wet *hours* and temperature, not instantaneous wetness: use `wet_dur_s` (or sum the `wet` column) with `temp_c`.
 

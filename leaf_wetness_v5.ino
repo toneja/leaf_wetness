@@ -1,6 +1,6 @@
 /*
-  Leaf wetness logger
-  -------------------
+  Leaf wetness logger, v6
+  -----------------------
   Hardware : RAK4631 core, PHYTOS31 leaf wetness sensor read through an
              Adafruit ADS1115 16-bit ADC, RAK1906 (BME680), RAK1921 OLED,
              RAK15002 microSD, u-blox GNSS module (I2C)
@@ -11,15 +11,25 @@
     PHYTOS31  supply -> 3V3_S,  ground -> GND,  signal -> ADS1115 A0
     ADS1115   VDD -> 3V3_S,  GND -> GND,  SDA/SCL -> the WisBlock I2C bus (address 0x48)
 
-  What it does, every SAMPLE_INTERVAL_MS:
-    1. Reads leaf wetness (volts -> percent), air temperature / humidity, and GPS time.
-    2. Decides whether the leaf is wet, and why (rain, dew, or unknown).
-    3. Tracks how long it has been wet, dry, and since the last rain.
-    4. Sends one CSV row to the SD card and Bluetooth (and to Serial when DEBUG is 1),
-       and updates the OLED.
+  Wetness algorithm: modelled on Binks et al. (2021), "Measuring the vertical
+  profile of leaf wetness in a forest canopy", MethodsX 8:101332. There are no
+  fixed wet/dry thresholds. Instead the sensor is averaged into 15-minute steps
+  and wetting is recognised by how fast the signal rises:
 
-  GPS time is only used to timestamp rows. The wet/dry durations come from the
-  internal clock, so logging works (with blank date/time) before the GPS has a fix.
+    RAIN  a rise of RAIN_RISE_MV or more in one step
+    DEW   a slow rise (DEW_MIN_RISE_MV..DEW_MAX_RISE_MV) for DEW_MIN_STEPS steps in a row
+    WET   a rise between the two (light rain, drizzle, fog: not in the paper)
+
+  The reading just before the wetting began becomes that period's baseline,
+  which makes the method immune to sensor drift and dirt. The leaf counts as dry
+  again when the signal falls back to within 10 % of the baseline.
+
+  Every SAMPLE_INTERVAL_MS the sketch reads the sensor and the air sensor, and
+  sends one CSV row to the SD card and Bluetooth (and Serial when DEBUG is 1),
+  and updates the OLED. The wet/dry state itself only changes every 15 minutes.
+
+  GPS time only timestamps rows. Durations use the internal clock, so logging
+  works (with blank date/time) before the GPS has a fix.
 */
 
 #include <Wire.h>
@@ -62,54 +72,58 @@ const int     MAX_LOG_FILES        = 9999;
 const char*   BLE_DEVICE_NAME      = "PHYTOS31 LOGGER";
 
 // ---- Timing ----
-const uint32_t SAMPLE_INTERVAL_MS  = 10000;
-const uint32_t RISE_WINDOW_MS      = 60000;    // "rise" = change over this window
-const int      RISE_WINDOW_SAMPLES = RISE_WINDOW_MS / SAMPLE_INTERVAL_MS;
+const uint32_t SAMPLE_INTERVAL_MS  = 10000;    // one reading (and one CSV row) per sample
+const uint32_t STEP_INTERVAL_MS    = 900000;   // the algorithm works on 15-minute averages
+const int      SAMPLES_PER_STEP    = STEP_INTERVAL_MS / SAMPLE_INTERVAL_MS;
 
 // ---- ADS1115 ----
-// GAIN_TWO = +/-2.048 V range (62.5 uV per bit). The PHYTOS31 can output up to
-// about half its supply voltage (~1.65 V), so GAIN_FOUR (+/-1.024 V) would clip.
+// GAIN_TWO = +/-2.048 V range. The PHYTOS31 can output up to about half its
+// supply voltage (~1.65 V), so GAIN_FOUR (+/-1.024 V) would clip.
 const int       LEAF_ADC_CHANNEL      = 0;
 const adsGain_t ADC_GAIN              = GAIN_TWO;
 const int       ADC_AVERAGING_SAMPLES = 8;
 
-// ---- Leaf wetness calibration ----
-// Output voltage with a clean dry sensor and a fully wet one. The range differs
-// a little for every sensor, so re-measure these for yours. The output scales
-// with supply voltage, so keep the supply steady (3V3_S).
-const float LEAF_DRY_VOLTS         = 0.350f;
-const float LEAF_WET_VOLTS         = 1.100f;
+// ---- Wetting detection (all values in millivolts of sensor output) ----
+// Starting values from Binks et al. (2021), who used the same sensor. Their
+// units and excitation voltage may differ from yours, so check against your logs.
+const float RAIN_RISE_MV       = 100.0f;   // rise in one step that means rain
+const float DEW_MIN_RISE_MV    = 1.0f;     // dew: each step rises by at least this...
+const float DEW_MAX_RISE_MV    = 15.0f;    // ...and by no more than this...
+const int   DEW_MIN_STEPS      = 5;        // ...for this many steps in a row (75 min)
 
-// ---- Leaf wetness thresholds (percent of the dry-to-wet range) ----
-const float WET_ON_PERCENT         = 3.0f;     // at or above: leaf becomes wet
-const float WET_OFF_PERCENT        = 1.5f;     // at or below: leaf becomes dry
-const float FILM_UPPER_PERCENT     = 20.0f;    // below this: thin film / dew
-const float WET_UPPER_PERCENT      = 75.0f;    // below this: wet; above: drenched
+// ---- Ending a wet period ----
+const float WET_END_FACTOR     = 1.10f;    // dry again below 110 % of the baseline
+const float QUIET_CHANGE_MV    = 0.5f;     // a step this flat counts as "levelled off"
+const int   DEW_QUIET_STEPS    = 5;        // dew must also be flat this many steps in a row
 
-// ---- Rain detection ----
-// Rain shows up two ways in real logs: a fast climb when the leaf first gets
-// soaked, and then constant jitter as drops land and run off (steps of 0.5 % or
-// more every few samples). A dry or merely damp sensor changes by 0.2 % or less
-// per sample, so counting big steps separates rain from dew and slow drying.
-const float    RAIN_MIN_RISE_PERCENT = 5.0f;   // rise within RISE_WINDOW that means rain
-const float    RAIN_STEP_PERCENT     = 0.5f;   // one sample-to-sample change this big is a "drop"
-const int      RAIN_MIN_BIG_STEPS    = 3;      // this many drops within RISE_WINDOW means rain
-const uint32_t RAIN_HOLD_MS          = 300000; // rain counts as ongoing this long after the last drop
-
-// ---- Wet-source detection ----
-const float DEW_MAX_DEPRESSION_C   = 1.5f;     // air this close to dew point => dew likely
-const float FROST_BELOW_C          = 1.0f;     // ice can read as "dry" below this
+// ---- Additions beyond the paper ----
+const float RAIN_RESURGE_MV    = 20.0f;    // during rain, a rise this big restarts "time since rain"
+const float DRY_FALLBACK_MV    = 350.0f;   // baseline if the logger powers up on an already wet leaf
 
 
 // =============================================================================
 //  Data types
 // =============================================================================
 
-struct LeafReading {
-  float volts;
-  float percent;         // 0 = dry calibration point, 100 = wet calibration point
-  float risePercent;     // change since RISE_WINDOW_MS ago
-  int   bigSteps;        // sample-to-sample jumps of RAIN_STEP_PERCENT or more within RISE_WINDOW_MS
+enum WetState { STATE_DRY, STATE_DEW, STATE_RAIN, STATE_WET };
+
+struct LeafWetness {
+  WetState state          = STATE_DRY;
+  float    baselineMv     = 0;       // dry level: before the current wet period began
+  float    prevStepMv     = 0;       // previous 15-minute average
+  float    lastStepMv     = 0;       // most recent 15-minute average
+  float    lastStepRiseMv = 0;       // ...and how much it rose over the one before
+  int      dewRunSteps    = 0;       // consecutive dew-sized rises so far
+  int      quietSteps     = 0;       // consecutive flat steps so far
+  bool     everWet        = false;
+  bool     everRained     = false;
+  uint32_t wetStartMs     = 0;
+  uint32_t dewRunStartMs  = 0;       // when the current run of dew-sized rises began
+  uint32_t lastWetEndMs   = 0;
+  uint32_t lastRainMs     = 0;       // last time rain was detected or surged
+  uint32_t totalWetMs     = 0;       // completed wet periods only
+  float    stepSumMv      = 0;       // accumulating the current 15-minute average
+  int      stepSamples    = 0;
 };
 
 struct AirReading {
@@ -117,26 +131,11 @@ struct AirReading {
   float temperatureC;
   float humidityPercent;
   float dewPointC;
-  float dewDepressionC;  // temperature minus dew point
 };
 
 struct UtcTime {
   bool valid;            // false until the GPS knows the date and time
   int  year, month, day, hour, minute, second;
-};
-
-enum WetSource { SOURCE_NONE, SOURCE_RAIN, SOURCE_DEW, SOURCE_UNKNOWN };
-
-struct WetnessState {
-  bool      isWet         = false;
-  bool      rainOngoing   = false;   // rain activity seen within RAIN_HOLD_MS
-  bool      everWet       = false;
-  bool      everRained    = false;
-  WetSource source        = SOURCE_NONE;
-  uint32_t  wetStartMs    = 0;
-  uint32_t  lastDryMs     = 0;
-  uint32_t  lastRainMs    = 0;
-  uint32_t  totalWetMs    = 0;       // completed wet periods only
 };
 
 // All values in seconds, ready for logging and display.
@@ -159,16 +158,12 @@ SFE_UBLOX_GNSS  gnss;                                               // GPS
 BLEDfu          bleDfu;                                             // over-the-air firmware updates
 BLEUart         bleUart;                                            // log rows over Bluetooth
 
-WetnessState wetness;
+LeafWetness wetness;
 bool     airSensorReady = false;
 bool     gnssReady      = false;
 bool     sdCardReady    = false;
 char     logFileName[16] = "";      // chosen at startup by chooseNewLogFileName()
 uint32_t lastSampleMs   = 0;
-
-// Ring buffer of recent leaf readings, used to measure how fast wetness rises.
-float recentPercent[RISE_WINDOW_SAMPLES];
-int   oldestReadingIndex = 0;
 
 
 // =============================================================================
@@ -207,32 +202,21 @@ float dewPointC(float temperatureC, float humidityPercent) {
   return B * g / (A - g);
 }
 
-const char* wetSourceName(WetSource source) {
-  switch (source) {
-    case SOURCE_RAIN:    return "RAIN";
-    case SOURCE_DEW:     return "DEW";
-    case SOURCE_UNKNOWN: return "WET";
-    default:             return "-";
+const char* stateName(WetState state) {
+  switch (state) {
+    case STATE_DEW:  return "DEW";
+    case STATE_RAIN: return "RAIN";
+    case STATE_WET:  return "WET";      // wet, but not shaped like dew or heavy rain
+    default:         return "DRY";
   }
 }
 
-const char* wetnessLevelName(float percent) {
-  if (percent < WET_OFF_PERCENT)    return "DRY";
-  if (percent < FILM_UPPER_PERCENT) return "FILM";
-  if (percent < WET_UPPER_PERCENT)  return "WET";
-  return "DRENCHED";
+bool isWet(const LeafWetness& w) {
+  return w.state != STATE_DRY;
 }
 
-bool isFrostRisk(const AirReading& air) {
-  return air.valid && air.temperatureC < FROST_BELOW_C;
-}
-
-float voltsToPercent(float volts) {
-  return (volts - LEAF_DRY_VOLTS) / (LEAF_WET_VOLTS - LEAF_DRY_VOLTS) * 100.0f;
-}
-
-// Shows a fatal startup problem on the OLED (and Serial in debug) and stops,
-// because the logger is useless without it.
+// Reports a fatal startup problem forever (the logger is useless without it).
+// Shown on the OLED, and on Serial in debug builds.
 void haltWithError(const char* message) {
   oled.clearBuffer();
   oled.drawStr(0, 9, message);
@@ -248,52 +232,22 @@ void haltWithError(const char* message) {
 //  Sensor reading
 // =============================================================================
 
-float readLeafVolts() {
+float readLeafMv() {
   float sum = 0;
   for (int i = 0; i < ADC_AVERAGING_SAMPLES; i++) {
     sum += adc.computeVolts(adc.readADC_SingleEnded(LEAF_ADC_CHANNEL));
   }
-  return sum / ADC_AVERAGING_SAMPLES;
-}
-
-// Stores the new reading and returns how much it differs from RISE_WINDOW_MS ago.
-float recordReadingAndGetRise(float percent) {
-  float rise = percent - recentPercent[oldestReadingIndex];
-  recentPercent[oldestReadingIndex] = percent;
-  oldestReadingIndex = (oldestReadingIndex + 1) % RISE_WINDOW_SAMPLES;
-  return rise;
-}
-
-// Counts how many sample-to-sample changes in the history were big (drops landing).
-// Call after recordReadingAndGetRise(): the oldest reading is then at oldestReadingIndex.
-int countBigSteps() {
-  int count = 0;
-  for (int i = 0; i < RISE_WINDOW_SAMPLES - 1; i++) {
-    float older = recentPercent[(oldestReadingIndex + i)     % RISE_WINDOW_SAMPLES];
-    float newer = recentPercent[(oldestReadingIndex + i + 1) % RISE_WINDOW_SAMPLES];
-    if (fabs(newer - older) >= RAIN_STEP_PERCENT) count++;
-  }
-  return count;
-}
-
-LeafReading readLeaf() {
-  LeafReading leaf;
-  leaf.volts       = readLeafVolts();
-  leaf.percent     = voltsToPercent(leaf.volts);
-  leaf.risePercent = recordReadingAndGetRise(leaf.percent);
-  leaf.bigSteps    = countBigSteps();
-  return leaf;
+  return sum / ADC_AVERAGING_SAMPLES * 1000.0f;
 }
 
 AirReading readAir() {
-  AirReading air = { false, NAN, NAN, NAN, NAN };
+  AirReading air = { false, NAN, NAN, NAN };
   if (!airSensorReady || !airSensor.performReading()) return air;
 
   air.valid           = true;
   air.temperatureC    = airSensor.temperature;
   air.humidityPercent = airSensor.humidity;
   air.dewPointC       = dewPointC(air.temperatureC, air.humidityPercent);
-  air.dewDepressionC  = air.temperatureC - air.dewPointC;
   return air;
 }
 
@@ -313,64 +267,113 @@ UtcTime readUtcTime() {
 
 
 // =============================================================================
-//  Wetness tracking
+//  Wetness tracking (Binks-style, on 15-minute steps)
 // =============================================================================
 
-// Rain = a fast climb, or a burst of drops landing. Slow dew or drying never qualifies.
-bool looksLikeRain(const LeafReading& leaf) {
-  return leaf.risePercent >= RAIN_MIN_RISE_PERCENT || leaf.bigSteps >= RAIN_MIN_BIG_STEPS;
+void markRain(LeafWetness& w, uint32_t nowMs) {
+  w.everRained = true;
+  w.lastRainMs = nowMs;
 }
 
-// Guesses why the leaf became wet, using how fast it rose and how close the air
-// is to its dew point.
-WetSource guessWetSource(const LeafReading& leaf, const AirReading& air) {
-  if (looksLikeRain(leaf))                                        return SOURCE_RAIN;
-  if (air.valid && air.dewDepressionC < DEW_MAX_DEPRESSION_C)     return SOURCE_DEW;
-  return SOURCE_UNKNOWN;
+// Begins a wet period. The rise that triggered it happened sometime within the
+// last step (or, for dew, started at the beginning of the run), so startMs is
+// back-dated to there.
+void startWetPeriod(LeafWetness& w, WetState newState, uint32_t startMs, uint32_t nowMs) {
+  w.state       = newState;
+  w.everWet     = true;
+  w.wetStartMs  = startMs;
+  w.dewRunSteps = 0;
+  if (newState == STATE_RAIN) markRain(w, nowMs);
 }
 
-void startWetPeriod(WetnessState& w, const LeafReading& leaf, const AirReading& air, uint32_t nowMs) {
-  w.isWet      = true;
-  w.everWet    = true;
-  w.wetStartMs = nowMs;
-  w.source     = guessWetSource(leaf, air);
+void endWetPeriod(LeafWetness& w, float stepMv, uint32_t nowMs) {
+  w.totalWetMs   += nowMs - w.wetStartMs;
+  w.lastWetEndMs  = nowMs;
+  w.state         = STATE_DRY;
+  w.baselineMv    = stepMv;
+  w.dewRunSteps   = 0;
 }
 
-void endWetPeriod(WetnessState& w, uint32_t nowMs) {
-  w.isWet       = false;
-  w.source      = SOURCE_NONE;
-  w.lastDryMs   = nowMs;
-  w.totalWetMs += nowMs - w.wetStartMs;
+// Dry leaf: watch for the signal starting to climb.
+void detectWetting(LeafWetness& w, float riseMv, uint32_t nowMs) {
+  uint32_t stepStartMs = nowMs - STEP_INTERVAL_MS;
+
+  // Follow the dry signal (drift, dirt) until a rise begins, then freeze it.
+  if (w.dewRunSteps == 0) w.baselineMv = w.prevStepMv;
+
+  if (riseMv >= RAIN_RISE_MV) {
+    startWetPeriod(w, STATE_RAIN, stepStartMs, nowMs);
+  } else if (riseMv > DEW_MAX_RISE_MV) {
+    startWetPeriod(w, STATE_WET, stepStartMs, nowMs);
+  } else if (riseMv >= DEW_MIN_RISE_MV) {
+    if (w.dewRunSteps == 0) w.dewRunStartMs = stepStartMs;
+    w.dewRunSteps++;
+    if (w.dewRunSteps >= DEW_MIN_STEPS) startWetPeriod(w, STATE_DEW, w.dewRunStartMs, nowMs);
+  } else {
+    w.dewRunSteps = 0;
+  }
 }
 
-void updateWetness(WetnessState& w, const LeafReading& leaf, const AirReading& air, uint32_t nowMs) {
-  // 1. Wet/dry transitions, with hysteresis so noise can't cause flicker.
-  if (!w.isWet && leaf.percent >= WET_ON_PERCENT) {
-    startWetPeriod(w, leaf, air, nowMs);
-  } else if (w.isWet && leaf.percent <= WET_OFF_PERCENT) {
-    endWetPeriod(w, nowMs);
+// Wet leaf: watch for rain landing on top, and for the signal returning to baseline.
+void trackWetPeriod(LeafWetness& w, float stepMv, float riseMv, uint32_t nowMs) {
+  if (riseMv >= RAIN_RISE_MV) {
+    w.state = STATE_RAIN;             // rain on a dewy or damp leaf; keep the old baseline
+    markRain(w, nowMs);
+  } else if (w.state == STATE_RAIN && riseMv >= RAIN_RESURGE_MV) {
+    markRain(w, nowMs);               // more water arriving during rain
   }
 
-  // 2. Rain (or irrigation) activity while wet, even on an already wet leaf.
-  //    Every sample with activity restarts the "time since rain" clock.
-  if (w.isWet && looksLikeRain(leaf)) {
-    w.everRained = true;
-    w.lastRainMs = nowMs;
-    w.source     = SOURCE_RAIN;
-  }
-
-  // 3. Rain stays "ongoing" for a few minutes after the last drop, so gaps between
-  //    drops don't flicker it off. Dry spells then count up from the last drop.
-  w.rainOngoing = w.everRained && (nowMs - w.lastRainMs) < RAIN_HOLD_MS;
+  bool backAtBaseline = stepMv < w.baselineMv * WET_END_FACTOR;
+  bool levelledOff    = w.state != STATE_DEW || w.quietSteps >= DEW_QUIET_STEPS;
+  if (backAtBaseline && levelledOff) endWetPeriod(w, stepMv, nowMs);
 }
 
-Durations computeDurations(const WetnessState& w, uint32_t nowMs) {
+// Handles one finished 15-minute average.
+void processStep(LeafWetness& w, float stepMv, uint32_t nowMs) {
+  float riseMv = stepMv - w.prevStepMv;
+
+  w.lastStepMv     = stepMv;
+  w.lastStepRiseMv = riseMv;
+  w.quietSteps     = (fabs(riseMv) < QUIET_CHANGE_MV) ? w.quietSteps + 1 : 0;
+
+  if (isWet(w)) trackWetPeriod(w, stepMv, riseMv, nowMs);
+  else          detectWetting(w, riseMv, nowMs);
+
+  w.prevStepMv = stepMv;
+}
+
+// Adds one reading to the running 15-minute average.
+void addSample(LeafWetness& w, float leafMv, uint32_t nowMs) {
+  w.stepSumMv += leafMv;
+  w.stepSamples++;
+  if (w.stepSamples < SAMPLES_PER_STEP) return;
+
+  float stepMv = w.stepSumMv / w.stepSamples;
+  w.stepSumMv   = 0;
+  w.stepSamples = 0;
+  processStep(w, stepMv, nowMs);
+}
+
+// First reading after power-up: use it as the baseline, unless the leaf is
+// already clearly wet, in which case fall back to a typical dry level.
+void initialiseWetness(LeafWetness& w, float firstMv, uint32_t nowMs) {
+  w.baselineMv = firstMv;
+  w.prevStepMv = firstMv;
+  w.lastStepMv = firstMv;
+
+  if (firstMv > DRY_FALLBACK_MV * WET_END_FACTOR) {
+    w.baselineMv = DRY_FALLBACK_MV;
+    startWetPeriod(w, STATE_WET, nowMs, nowMs);
+  }
+}
+
+Durations computeDurations(const LeafWetness& w, uint32_t nowMs) {
   Durations d;
-  d.wetFor    = w.isWet ? secondsBetween(nowMs, w.wetStartMs) : 0;
-  d.dryFor    = (!w.isWet && w.everWet) ? secondsBetween(nowMs, w.lastDryMs) : 0;
+  d.wetFor    = isWet(w) ? secondsBetween(nowMs, w.wetStartMs) : 0;
+  d.dryFor    = (!isWet(w) && w.everWet) ? secondsBetween(nowMs, w.lastWetEndMs) : 0;
   d.sinceRain = w.everRained ? secondsBetween(nowMs, w.lastRainMs) : 0;
 
-  uint32_t currentWetMs = w.isWet ? (nowMs - w.wetStartMs) : 0;
+  uint32_t currentWetMs = isWet(w) ? (nowMs - w.wetStartMs) : 0;
   d.totalWet  = (w.totalWetMs + currentWetMs) / 1000;
   return d;
 }
@@ -380,25 +383,25 @@ Durations computeDurations(const WetnessState& w, uint32_t nowMs) {
 //  Logging (Serial + SD card + Bluetooth)
 // =============================================================================
 
+// mv = leaf reading now; state, baseline_mv, step_mv and step_rise_mv only
+// change when a 15-minute step finishes.
 const char* CSV_HEADER =
-  "date,time,uptime_s,volts,wet_pct,class,rise_pct_min,wet,source,wet_dur_s,"
-  "since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c,depr_c,frost";
+  "date,time,uptime_s,mv,state,baseline_mv,step_mv,step_rise_mv,wet_dur_s,"
+  "since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c";
 
 void formatCsvRow(char* out, size_t outSize, uint32_t nowMs, const UtcTime& utc,
-                  const LeafReading& leaf, const AirReading& air,
-                  const WetnessState& w, const Durations& d) {
+                  float leafMv, const LeafWetness& w, const AirReading& air,
+                  const Durations& d) {
   char timestamp[24];
   formatTimestamp(utc, timestamp, sizeof timestamp);
 
   snprintf(out, outSize,
-           "%s,%lu,%.4f,%.1f,%s,%.1f,%d,%s,%lu,%lu,%lu,%lu,%.1f,%.1f,%.1f,%.1f,%d",
+           "%s,%lu,%.1f,%s,%.1f,%.1f,%.1f,%lu,%lu,%lu,%lu,%.1f,%.1f,%.1f",
            timestamp, (unsigned long)(nowMs / 1000),
-           leaf.volts, leaf.percent, wetnessLevelName(leaf.percent), leaf.risePercent,
-           w.isWet ? 1 : 0, wetSourceName(w.source),
+           leafMv, stateName(w.state), w.baselineMv, w.lastStepMv, w.lastStepRiseMv,
            (unsigned long)d.wetFor, (unsigned long)d.dryFor,
            (unsigned long)d.sinceRain, (unsigned long)d.totalWet,
-           air.temperatureC, air.humidityPercent, air.dewPointC, air.dewDepressionC,
-           isFrostRisk(air) ? 1 : 0);
+           air.temperatureC, air.humidityPercent, air.dewPointC);
 }
 
 // Opens and closes the file on every write so a power cut can't corrupt it.
@@ -432,38 +435,35 @@ void drawRow(int row, const char* text) {
   oled.drawStr(0, FIRST_BASELINE_Y + row * ROW_HEIGHT, text);
 }
 
-void drawDisplay(const LeafReading& leaf, const AirReading& air, const UtcTime& utc,
-                 const WetnessState& w, const Durations& d) {
+void drawDisplay(float leafMv, const AirReading& air, const UtcTime& utc,
+                 const LeafWetness& w, const Durations& d) {
   char text[24];
-  char duration[24];
+  char duration[12];      // longest is "49710d 23h"
 
   oled.clearBuffer();
 
-  // Row 0: wet/dry state, source, warnings for missing SD card or GPS time
-  snprintf(text, sizeof text, "%s %s%s%s",
-           w.isWet ? "WET" : "dry",
-           w.isWet ? wetSourceName(w.source) : "",
+  // Row 0: wet/dry state, warnings for missing SD card or GPS time
+  snprintf(text, sizeof text, "%s%s%s",
+           stateName(w.state),
            sdCardReady ? "" : " !SD",
            utc.valid   ? "" : " !GPS");
   drawRow(0, text);
 
-  // Row 1: leaf voltage, percent and level
-  snprintf(text, sizeof text, "%.3fV %.0f%% %s",
-           leaf.volts, leaf.percent, wetnessLevelName(leaf.percent));
+  // Row 1: leaf reading and baseline
+  snprintf(text, sizeof text, "%.0f mV base %.0f", leafMv, w.baselineMv);
   drawRow(1, text);
 
-  // Row 2: air conditions (dd = dew point depression)
+  // Row 2: air conditions
   if (air.valid) {
-    snprintf(text, sizeof text, "%.1fC %.0f%% dd%.1f%s",
-             air.temperatureC, air.humidityPercent, air.dewDepressionC,
-             isFrostRisk(air) ? " ICE?" : "");
+    snprintf(text, sizeof text, "%.1fC %.0f%% dp%.1f",
+             air.temperatureC, air.humidityPercent, air.dewPointC);
   } else {
     snprintf(text, sizeof text, "No air sensor");
   }
   drawRow(2, text);
 
   // Row 3: how long it has been wet or dry
-  if (w.isWet) {
+  if (isWet(w)) {
     formatDuration(d.wetFor, duration, sizeof duration);
     snprintf(text, sizeof text, "Wet for %s", duration);
   } else if (w.everWet) {
@@ -474,11 +474,9 @@ void drawDisplay(const LeafReading& leaf, const AirReading& air, const UtcTime& 
   }
   drawRow(3, text);
 
-  // Row 4: time since rain
+  // Row 4: time since rain was last detected
   if (!w.everRained) {
     snprintf(text, sizeof text, "Rain: none seen");
-  } else if (w.rainOngoing) {
-    snprintf(text, sizeof text, "Rain: ongoing");
   } else {
     formatDuration(d.sinceRain, duration, sizeof duration);
     snprintf(text, sizeof text, "Rain: %s ago", duration);
@@ -616,20 +614,6 @@ void startBluetooth() {
   Bluefruit.Advertising.start(0);                     // advertise forever
 }
 
-// Fills the history with the first reading so the first "rise" is zero, and
-// handles the case where the leaf is already wet at power-on.
-void initialiseWetnessFromFirstReading() {
-  float firstPercent = voltsToPercent(readLeafVolts());
-  for (int i = 0; i < RISE_WINDOW_SAMPLES; i++) recentPercent[i] = firstPercent;
-
-  if (firstPercent >= WET_ON_PERCENT) {
-    wetness.isWet      = true;
-    wetness.everWet    = true;
-    wetness.wetStartMs = millis();
-    wetness.source     = SOURCE_UNKNOWN;
-  }
-}
-
 void setup() {
 #if DEBUG
   startDebugSerial();
@@ -643,7 +627,7 @@ void setup() {
   startGnss();
   startSdCard();
   startBluetooth();
-  initialiseWetnessFromFirstReading();
+  initialiseWetness(wetness, readLeafMv(), millis());
 
   DEBUG_PRINTLN(CSV_HEADER);
 }
@@ -658,16 +642,16 @@ void loop() {
   if (nowMs - lastSampleMs < SAMPLE_INTERVAL_MS) return;
   lastSampleMs = nowMs;
 
-  LeafReading leaf = readLeaf();
-  AirReading  air  = readAir();
-  UtcTime     utc  = readUtcTime();
+  float      leafMv = readLeafMv();
+  AirReading air    = readAir();
+  UtcTime    utc    = readUtcTime();
 
-  updateWetness(wetness, leaf, air, nowMs);
+  addSample(wetness, leafMv, nowMs);
   Durations durations = computeDurations(wetness, nowMs);
 
-  char row[220];
-  formatCsvRow(row, sizeof row, nowMs, utc, leaf, air, wetness, durations);
+  char row[200];
+  formatCsvRow(row, sizeof row, nowMs, utc, leafMv, wetness, air, durations);
   logLine(row);
 
-  drawDisplay(leaf, air, utc, wetness, durations);
+  drawDisplay(leafMv, air, utc, wetness, durations);
 }

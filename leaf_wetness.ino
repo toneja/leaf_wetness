@@ -1,15 +1,17 @@
 /*
-  Leaf wetness logger, v6
+  Leaf wetness logger, v7
   -----------------------
   Hardware : RAK4631 core, PHYTOS31 leaf wetness sensor read through an
              Adafruit ADS1115 16-bit ADC, RAK1906 (BME680), RAK1921 OLED,
-             RAK15002 microSD, u-blox GNSS module (I2C)
+             RAK15002 microSD, u-blox GNSS module (I2C),
+             Texas Electronics TR-525M tipping bucket rain gauge
   Libraries: Adafruit ADS1X15, U8g2, Adafruit BME680 (+ Adafruit Unified Sensor),
              SparkFun u-blox GNSS; SD.h and bluefruit.h are built in
 
   Wiring:
     PHYTOS31  supply -> 3V3_S,  ground -> GND,  signal -> ADS1115 A0
     ADS1115   VDD -> 3V3_S,  GND -> GND,  SDA/SCL -> the WisBlock I2C bus (address 0x48)
+    TR-525M   one reed switch lead -> WB_IO3,  the other -> GND  (polarity does not matter)
 
   Wetness algorithm: modelled on Binks et al. (2021), "Measuring the vertical
   profile of leaf wetness in a forest canopy", MethodsX 8:101332. There are no
@@ -27,6 +29,10 @@
   Every SAMPLE_INTERVAL_MS the sketch reads the sensor and the air sensor, and
   sends one CSV row to the SD card and Bluetooth (and Serial when DEBUG is 1),
   and updates the OLED. The wet/dry state itself only changes every 15 minutes.
+
+  Rain gauge: each tip closes a reed switch, which pulls WB_IO3 low. Tips are
+  counted by an interrupt and logged next to the leaf data, so the two can be
+  compared. The gauge is logging only: the wetness algorithm does not use it.
 
   GPS time only timestamps rows. Durations use the internal clock, so logging
   works (with blank date/time) before the GPS has a fix.
@@ -70,6 +76,7 @@ const uint8_t BME680_I2C_ADDRESS   = 0x76;     // RAK1906
 const char*   LOG_FILE_PATTERN     = "WET%04d.CSV";
 const int     MAX_LOG_FILES        = 9999;
 const char*   BLE_DEVICE_NAME      = "PHYTOS31 LOGGER";
+const int     RAIN_GAUGE_PIN       = WB_IO3;   // TR-525M reed switch to GND
 
 // ---- Timing ----
 const uint32_t SAMPLE_INTERVAL_MS  = 10000;    // one reading (and one CSV row) per sample
@@ -82,6 +89,11 @@ const int      SAMPLES_PER_STEP    = STEP_INTERVAL_MS / SAMPLE_INTERVAL_MS;
 const int       LEAF_ADC_CHANNEL      = 0;
 const adsGain_t ADC_GAIN              = GAIN_TWO;
 const int       ADC_AVERAGING_SAMPLES = 8;
+
+// ---- Rain gauge ----
+const float    RAIN_GAUGE_MM_PER_TIP = 0.1f;   // TR-525M: 0.1 mm (0.004 in) per tip
+const uint32_t TIP_DEBOUNCE_MS       = 50;     // ignore closures this soon after a counted tip
+                                               // (the switch stays closed ~135 ms per tip)
 
 // ---- Wetting detection (all values in millivolts of sensor output) ----
 // Starting values from Binks et al. (2021), who used the same sensor. Their
@@ -138,6 +150,13 @@ struct UtcTime {
   int  year, month, day, hour, minute, second;
 };
 
+struct RainGauge {
+  uint32_t tipsNow;      // tips since the previous sample
+  uint32_t tipsTotal;    // tips since power-on
+  bool     everTipped;
+  uint32_t lastTipMs;    // millis() of the most recent tip
+};
+
 // All values in seconds, ready for logging and display.
 struct Durations {
   uint32_t wetFor;       // 0 when dry
@@ -159,6 +178,11 @@ BLEDfu          bleDfu;                                             // over-the-
 BLEUart         bleUart;                                            // log rows over Bluetooth
 
 LeafWetness wetness;
+
+// Written by the rain gauge interrupt, read with interrupts off (see readRainGauge).
+volatile uint32_t tipCount     = 0;
+volatile uint32_t lastTipTimeMs = 0;
+uint32_t tipsAtLastSample      = 0;
 bool     airSensorReady = false;
 bool     gnssReady      = false;
 bool     sdCardReady    = false;
@@ -249,6 +273,35 @@ AirReading readAir() {
   air.humidityPercent = airSensor.humidity;
   air.dewPointC       = dewPointC(air.temperatureC, air.humidityPercent);
   return air;
+}
+
+// Runs on every closure of the rain gauge switch. Keep it short: no Serial here.
+void onRainGaugeTip() {
+  uint32_t nowMs = millis();
+  bool isBounce  = tipCount > 0 && (nowMs - lastTipTimeMs) < TIP_DEBOUNCE_MS;
+  if (isBounce) return;
+
+  tipCount++;
+  lastTipTimeMs = nowMs;
+}
+
+RainGauge readRainGauge() {
+  noInterrupts();                       // so a tip can't land between the two reads
+  uint32_t total = tipCount;
+  uint32_t last  = lastTipTimeMs;
+  interrupts();
+
+  RainGauge g;
+  g.tipsTotal  = total;
+  g.tipsNow    = total - tipsAtLastSample;
+  g.everTipped = total > 0;
+  g.lastTipMs  = last;
+  tipsAtLastSample = total;
+  return g;
+}
+
+float rainfallMm(const RainGauge& g) {
+  return g.tipsTotal * RAIN_GAUGE_MM_PER_TIP;
 }
 
 UtcTime readUtcTime() {
@@ -384,24 +437,29 @@ Durations computeDurations(const LeafWetness& w, uint32_t nowMs) {
 // =============================================================================
 
 // mv = leaf reading now; state, baseline_mv, step_mv and step_rise_mv only
-// change when a 15-minute step finishes.
+// change when a 15-minute step finishes. tips = rain gauge tips since the
+// previous row; tips_total and rain_mm count from power-on.
 const char* CSV_HEADER =
   "date,time,uptime_s,mv,state,baseline_mv,step_mv,step_rise_mv,wet_dur_s,"
-  "since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c";
+  "since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c,"
+  "tips,tips_total,rain_mm,since_tip_s";
 
 void formatCsvRow(char* out, size_t outSize, uint32_t nowMs, const UtcTime& utc,
                   float leafMv, const LeafWetness& w, const AirReading& air,
-                  const Durations& d) {
+                  const Durations& d, const RainGauge& gauge) {
   char timestamp[24];
   formatTimestamp(utc, timestamp, sizeof timestamp);
+  unsigned long sinceTip = gauge.everTipped ? secondsBetween(nowMs, gauge.lastTipMs) : 0;
 
   snprintf(out, outSize,
-           "%s,%lu,%.1f,%s,%.1f,%.1f,%.1f,%lu,%lu,%lu,%lu,%.1f,%.1f,%.1f",
+           "%s,%lu,%.1f,%s,%.1f,%.1f,%.1f,%lu,%lu,%lu,%lu,%.1f,%.1f,%.1f,%lu,%lu,%.1f,%lu",
            timestamp, (unsigned long)(nowMs / 1000),
            leafMv, stateName(w.state), w.baselineMv, w.lastStepMv, w.lastStepRiseMv,
            (unsigned long)d.wetFor, (unsigned long)d.dryFor,
            (unsigned long)d.sinceRain, (unsigned long)d.totalWet,
-           air.temperatureC, air.humidityPercent, air.dewPointC);
+           air.temperatureC, air.humidityPercent, air.dewPointC,
+           (unsigned long)gauge.tipsNow, (unsigned long)gauge.tipsTotal,
+           rainfallMm(gauge), sinceTip);
 }
 
 // Opens and closes the file on every write so a power cut can't corrupt it.
@@ -436,8 +494,9 @@ void drawRow(int row, const char* text) {
 }
 
 void drawDisplay(float leafMv, const AirReading& air, const UtcTime& utc,
-                 const LeafWetness& w, const Durations& d) {
-  char text[24];
+                 const LeafWetness& w, const Durations& d,
+                 const RainGauge& gauge, uint32_t nowMs) {
+  char text[28];
   char duration[12];      // longest is "49710d 23h"
 
   oled.clearBuffer();
@@ -474,18 +533,22 @@ void drawDisplay(float leafMv, const AirReading& air, const UtcTime& utc,
   }
   drawRow(3, text);
 
-  // Row 4: time since rain was last detected
+  // Row 4: time since the leaf sensor last detected rain
   if (!w.everRained) {
-    snprintf(text, sizeof text, "Rain: none seen");
+    snprintf(text, sizeof text, "Leaf rain: none");
   } else {
     formatDuration(d.sinceRain, duration, sizeof duration);
-    snprintf(text, sizeof text, "Rain: %s ago", duration);
+    snprintf(text, sizeof text, "Leaf rain %s ago", duration);
   }
   drawRow(4, text);
 
-  // Row 5: cumulative wet time
-  formatDuration(d.totalWet, duration, sizeof duration);
-  snprintf(text, sizeof text, "Wet total %s", duration);
+  // Row 5: rain gauge total and time since its last tip
+  if (!gauge.everTipped) {
+    snprintf(text, sizeof text, "Gauge %.1fmm no tips", rainfallMm(gauge));
+  } else {
+    formatDuration(secondsBetween(nowMs, gauge.lastTipMs), duration, sizeof duration);
+    snprintf(text, sizeof text, "Gauge %.1fmm %s", rainfallMm(gauge), duration);
+  }
   drawRow(5, text);
 
   oled.sendBuffer();
@@ -526,6 +589,11 @@ void startSensorPower() {
   pinMode(SENSOR_POWER_PIN, OUTPUT);
   digitalWrite(SENSOR_POWER_PIN, HIGH);   // kept on: the ADC and OLED share this rail
   delay(300);
+}
+
+void startRainGauge() {
+  pinMode(RAIN_GAUGE_PIN, INPUT_PULLUP);              // switch to GND pulls the pin low
+  attachInterrupt(digitalPinToInterrupt(RAIN_GAUGE_PIN), onRainGaugeTip, FALLING);
 }
 
 void startAdc() {
@@ -620,6 +688,7 @@ void setup() {
 #endif
 
   startSensorPower();
+  startRainGauge();
   Wire.begin();
   startDisplay();          // before the ADC so a fatal ADC error can be shown on screen
   startAdc();
@@ -645,13 +714,14 @@ void loop() {
   float      leafMv = readLeafMv();
   AirReading air    = readAir();
   UtcTime    utc    = readUtcTime();
+  RainGauge  gauge  = readRainGauge();
 
   addSample(wetness, leafMv, nowMs);
   Durations durations = computeDurations(wetness, nowMs);
 
-  char row[200];
-  formatCsvRow(row, sizeof row, nowMs, utc, leafMv, wetness, air, durations);
+  char row[240];
+  formatCsvRow(row, sizeof row, nowMs, utc, leafMv, wetness, air, durations, gauge);
   logLine(row);
 
-  drawDisplay(leafMv, air, utc, wetness, durations);
+  drawDisplay(leafMv, air, utc, wetness, durations, gauge, nowMs);
 }

@@ -1,6 +1,6 @@
 # Leaf Wetness Logger
 
-A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, built for vineyard canopy monitoring. It reads the sensor every 10 seconds, works out whether the leaf is wet and *why* (rain, dew, or unknown) from how fast the signal rises, tracks how long it has been wet, dry, and since the last rain, and logs everything to a microSD card and Bluetooth (and to Serial when `DEBUG` is on), with a live OLED readout.
+A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, built for vineyard canopy monitoring. It reads the sensor every 10 seconds, works out whether the leaf is wet and *why* (rain, dew, or unknown) from how fast the signal rises, tracks how long it has been wet, dry, and since the last rain, and logs everything to a microSD card and Bluetooth (and to Serial when `DEBUG` is on), with a live OLED readout. A tipping bucket rain gauge is logged alongside, as ground truth for rain events.
 
 The wetness algorithm follows Binks et al. (2021), who used the same sensor: no fixed wet/dry thresholds, a floating per-event baseline, and rain/dew told apart by rate of rise. See [How it works](#how-it-works).
 
@@ -11,6 +11,7 @@ The wetness algorithm follows Binks et al. (2021), who used the same sensor: no 
 - No calibration endpoints: the baseline is the reading just before each wetting, so drift and dirt do not matter
 - Wet duration, dry duration, time since last rain, and cumulative wet time
 - Air temperature, humidity and dew point from a BME680 (logged for context, not used to classify)
+- Tipping bucket rain gauge (TR-525M) on `WB_IO3`: interrupt-driven tip counting with debounce, logged as tips per sample, running total, rainfall in mm, and time since the last tip (logged only; not used by the wetness algorithm)
 - UTC timestamps from a u-blox GPS (logging starts before a fix; date/time are blank until one arrives)
 - One CSV row per sample, sent to the SD card and Bluetooth UART (and Serial in debug mode)
 - A new SD file on every boot, so earlier logs are never touched
@@ -26,6 +27,7 @@ The wetness algorithm follows Binks et al. (2021), who used the same sensor: no 
 | GPS timestamps | Yes |
 | Bluetooth UART | Yes |
 | Wetness algorithm (v6) | Replayed offline against `WET0002.CSV`; not yet run live on the device |
+| TR-525M rain gauge (v7) | Not yet. Tip counting and debounce are checked in a desktop test build only |
 | RAK1921 OLED | Not yet |
 | microSD logging | Not yet |
 
@@ -40,6 +42,7 @@ The wetness algorithm follows Binks et al. (2021), who used the same sensor: no 
 | RAK1921 | 128x64 OLED (SSD1306) | I2C |
 | RAK15002 | microSD | |
 | u-blox GNSS module | UTC time | I2C, e.g. RAK12500 |
+| Texas Electronics TR-525M | Tipping bucket rain gauge | Reed switch, 0.1 mm per tip, on `WB_IO3` |
 
 ### Wiring
 
@@ -51,7 +54,12 @@ PHYTOS31   supply  -> 3V3_S
 ADS1115    VDD     -> 3V3_S
            GND     -> GND
            SDA/SCL -> WisBlock I2C bus
+
+TR-525M    reed switch lead 1 -> WB_IO3
+           reed switch lead 2 -> GND
 ```
+
+The reed switch has no polarity. The sketch turns on the pin's internal pull-up, so no external resistor is needed. Check which two of the gauge's wires are the switch against its manual.
 
 `3V3_S` is the switched sensor rail, enabled by the sketch through `WB_IO2`. It stays on permanently because the ADC and OLED share it. The PHYTOS31 output is a fraction of its supply voltage, so keep the supply steady: the millivolt thresholds below are only valid for the supply they were chosen at.
 
@@ -87,6 +95,9 @@ All tunables are at the top of the sketch. Millivolt values are the sensor's out
 | `DEW_QUIET_STEPS` | 5 | Dew must also be levelled off this many steps in a row to end |
 | `RAIN_RESURGE_MV` | 20 | During rain, a rise this big restarts "time since rain" (not in the paper) |
 | `DRY_FALLBACK_MV` | 350 | Baseline if the logger powers up on an already wet leaf (not in the paper) |
+| `RAIN_GAUGE_PIN` | `WB_IO3` | Pin the rain gauge reed switch is wired to |
+| `RAIN_GAUGE_MM_PER_TIP` | 0.1 | Rainfall per tip. 0.1 mm for the TR-525M |
+| `TIP_DEBOUNCE_MS` | 50 | Closures this soon after a counted tip are ignored |
 | `BLE_DEVICE_NAME` | `PHYTOS31 LOGGER` | Bluetooth advertising name |
 
 **Why `GAIN_TWO`:** the PHYTOS31 can output up to about half its supply (~1.65 V). `GAIN_FOUR` (+/-1.024 V) would clip a fully wet reading.
@@ -131,6 +142,12 @@ Replaying the algorithm on `WET0002.CSV` (a real log, 8 hours, rain starting abo
 
 No false wetting in the dry first 40 minutes, and the leaf never dropped back below 110 % of baseline (about 389 mV) in the remaining 8 hours, so the state stayed RAIN. The log shows a slowly drying sensor at 466 mV even after 8 hours.
 
+### Rain gauge
+
+Each tip of the bucket closes a reed switch, which pulls `WB_IO3` low. A falling-edge interrupt counts it, ignoring any closure within `TIP_DEBOUNCE_MS` of the last counted tip. According to the LI-COR and Campbell Scientific documentation for this gauge, the switch stays closed for about 135 ms per tip and bounces for under 1 ms, so counting only the falling edge and a 50 ms window gives one count per tip. Every 10-second row logs the tips since the previous row, the running total (and rainfall in mm), and the seconds since the last tip.
+
+The gauge is **logging only**. The wetness algorithm does not use it, so you can compare the two and tune the leaf thresholds against what actually fell. Counts restart at zero on every reset.
+
 ### Dew vs the air sensor
 
 The BME680 is inside a sealed enclosure, so its temperature and humidity do not match the air at the leaves, and **no classification uses it**. It is logged for context only. Once a shielded sensor (e.g. SHT31) is mounted at canopy height, a humidity or dew-point check can be added.
@@ -147,8 +164,8 @@ This is a heuristic from one leaf sensor. It cannot distinguish every case (see 
 | 1 | Leaf reading and baseline, in mV | `542 mV base 354` |
 | 2 | Temp, RH, dew point | `14.2C 95% dp13.5` |
 | 3 | Time wet or dry | `Wet for 1h 12m` |
-| 4 | Time since rain was last detected | `Rain: 4h 10m ago` |
-| 5 | Cumulative wet time since boot | `Wet total 6h 30m` |
+| 4 | Time since the leaf sensor last detected rain | `Leaf rain 4h 10m ago` |
+| 5 | Rain gauge total and time since its last tip | `Gauge 12.3mm 4m 05s` |
 
 Warnings on row 0: `!SD` means the SD card is missing or a write failed, `!GPS` means no valid GPS time yet.
 
@@ -159,29 +176,29 @@ Each sample produces one CSV row. Serial (debug builds only) prints the header a
 ## CSV reference
 
 ```
-date,time,uptime_s,mv,state,baseline_mv,step_mv,step_rise_mv,wet_dur_s,since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c
+date,time,uptime_s,mv,state,baseline_mv,step_mv,step_rise_mv,wet_dur_s,since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c,tips,tips_total,rain_mm,since_tip_s
 ```
 
-Rows come every 10 seconds, but the algorithm only decides every 15 minutes. `mv` is the live reading. `state`, `baseline_mv`, `step_mv` and `step_rise_mv` only change when a step finishes.
+Rows come every 10 seconds, but the algorithm only decides every 15 minutes. `mv` is the live reading. `state`, `baseline_mv`, `step_mv` and `step_rise_mv` only change when a step finishes. `tips` is rain gauge tips since the previous row.
 
 ### Example rows
 
 Dry leaf, GPS time available:
 
 ```
-2026-10-13,21:30:03,480,353.6,DRY,353.8,353.5,-0.3,0,0,0,0,20.5,55.6,11.3
+2026-10-13,21:30:03,480,353.6,DRY,353.8,353.5,-0.3,0,0,0,0,20.5,55.6,11.3,0,0,0.0,0
 ```
 
 Three minutes after the rain was recognised:
 
 ```
-2026-10-13,22:25:03,3790,545.2,RAIN,353.5,541.7,164.8,1090,0,190,1090,16.6,53.8,6.9
+2026-10-13,22:25:03,3790,545.2,RAIN,353.5,541.7,164.8,1090,0,190,1090,16.6,53.8,6.9,3,41,4.1,4
 ```
 
 No GPS fix yet (date and time are empty):
 
 ```
-,,42,353.8,DRY,353.8,353.8,0.0,0,0,0,0,20.5,55.8,11.4
+,,42,353.8,DRY,353.8,353.8,0.0,0,0,0,0,20.5,55.8,11.4,0,0,0.0,0
 ```
 
 ### Columns
@@ -203,6 +220,10 @@ No GPS fix yet (date and time are empty):
 | 13 | `temp_c` | degC | Air temperature from the BME680 (inside the enclosure). `nan` if the sensor is missing. |
 | 14 | `rh_pct` | %RH | Relative humidity from the BME680. `nan` if the sensor is missing. |
 | 15 | `dewpt_c` | degC | Dew point (Magnus formula) from the two values above. `nan` if the sensor is missing. |
+| 16 | `tips` | count | Rain gauge tips since the previous row (normally 10 s earlier). |
+| 17 | `tips_total` | count | Tips since power-on. |
+| 18 | `rain_mm` | mm | `tips_total` x 0.1 mm. Rainfall since power-on. |
+| 19 | `since_tip_s` | s | Seconds since the last counted tip. 0 if there has been none since boot (check `tips_total`). |
 
 ### Reading the columns together
 
@@ -210,6 +231,7 @@ No GPS fix yet (date and time are empty):
 - **Zeros are ambiguous.** `since_wet_s = 0` means "currently wet" or "never wet"; `since_rain_s = 0` means "no rain seen" (it counts up from 0 right after rain, so check `state`).
 - **`since_rain_s` is not "time since the last drop".** It only restarts on a step-sized rise, so rain that falls steadily on an already wet sensor without raising the 15-minute average by 20 mV will not restart it.
 - **Rain wetness can last for hours.** The state stays RAIN until the signal returns to within 10 % of the baseline, even long after the rain stopped. Use `since_rain_s` for how long ago it rained, and `state` for whether the sensor is still wet.
+- **Comparing leaf and gauge:** `tips` shows when rain actually fell, to within one 10-second row. Compare it with `mv` and `step_rise_mv` to see how quickly the leaf sensor responds, and whether rain that fell between steps was missed. One tip is 0.1 mm, so light drizzle may take minutes per tip. Rain rate over a window is the tips in that window x 0.1 mm.
 - **Disease models** need wet *hours* and temperature, not instantaneous wetness: use `wet_dur_s` (or sum rows where `state` is not `DRY`) with an air temperature from a representative sensor.
 
 ### Quick analysis (Python)
@@ -228,6 +250,7 @@ print(daily_wet_hours)
 
 ## Limitations
 
+- **Rain gauge counts are since boot.** A reset sets `tips_total` and `rain_mm` back to zero. A bucket that has not yet tipped holds some water, so the log lags the actual rain by up to 0.1 mm and by the time the next tip takes.
 - **No real-time clock.** Durations and `uptime_s` restart at every reset, and so do the baseline and totals. Rows only carry real dates once the GPS has a fix.
 - **One sensor cannot always separate dew, fog, drizzle and irrigation.** The `state` column is a best guess from the rate of rise.
 - **Light rain can look like dew.** A rise of under 1 mV a step is ignored, and a run of small rises reads as dew, not rain.
@@ -249,6 +272,7 @@ print(daily_wet_hours)
 | Blank or upside-down OLED | `U8G2_R2` rotates 180 degrees (use `U8G2_R0` for the other way). Confirm the I2C address and module. |
 | State stuck on `DRY` during rain | Check `step_rise_mv` in the log. If rises are under `DEW_MAX_RISE_MV` the algorithm sees dew-sized changes; compare with raw `mv`. |
 | State stuck on a wet state for hours | Normal after rain: it ends only when the signal returns near `baseline_mv`. Check `step_mv` against `baseline_mv` x 1.10. |
+| `tips_total` stays 0 in rain | Switch wiring (WB_IO3 and GND), and that the funnel is level and unblocked. Short the two leads together and confirm a tip is counted. |
 | `!GPS` never clears | GPS needs a clear sky view. Allow several minutes for a first fix. |
 
 ## Roadmap
@@ -256,7 +280,7 @@ print(daily_wet_hours)
 - Shielded SHT31 at canopy height, then a humidity/dew-point check for DEW vs fog
 - Real-time clock fallback so durations survive resets
 - Test and document the OLED and SD paths
-- Optional tipping-bucket rain gauge for a true "time since rain"
+- Use the rain gauge data to tune the leaf rain thresholds (or cross-check them)
 
 ## References
 

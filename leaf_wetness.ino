@@ -1,5 +1,5 @@
 /*
-  Leaf wetness logger, v8
+  Leaf wetness logger, v9
   -----------------------
   Hardware : RAK4631 core, PHYTOS31 leaf wetness sensor read through an
              Adafruit ADS1115 16-bit ADC, RAK1906 (BME680), RAK1921 OLED,
@@ -38,8 +38,21 @@
   averaging over 15 minutes hides. See the README for what the logs showed.
 
   Every SAMPLE_INTERVAL_MS the sketch reads the sensor and the air sensor, and
-  sends one CSV row to the SD card and Bluetooth (and Serial when DEBUG is 1),
-  and updates the OLED.
+  sends one CSV row to the SD card (and Serial when DEBUG is 1), and updates
+  the OLED.
+
+  Bluetooth: the logger is a BLE central. It scans for devices that offer the
+  Nordic UART service, connects to up to MAX_PERIPHERALS of them, and after every
+  sample sends each one a single line:
+
+      raining,rain_24h_mm,seconds_since_rain_stopped      e.g.  0,2.5,7200
+
+    raining                1 while the state is RAIN, otherwise 0
+    rain_24h_mm            gauge rainfall over the last 24 hours (since power-on
+                           if the logger has run for less than that)
+    seconds_since_rain_stopped
+                           0 while raining, counting up once RAIN ends;
+                           -1 if no rain has been seen since power-on
 
   GPS time only timestamps rows. Durations use the internal clock, so logging
   works (with blank date/time) before the GPS has a fix.
@@ -82,7 +95,7 @@ const uint8_t BME680_I2C_ADDRESS   = 0x76;     // RAK1906
 // Each boot starts a new log file: WET0001.CSV, WET0002.CSV, ... (8.3 names work on any SD library).
 const char*   LOG_FILE_PATTERN     = "WET%04d.CSV";
 const int     MAX_LOG_FILES        = 9999;
-const char*   BLE_DEVICE_NAME      = "PHYTOS31 LOGGER";
+const int     MAX_PERIPHERALS      = 4;        // BLE devices the logger will stay connected to
 const int     RAIN_GAUGE_PIN       = WB_IO3;   // TR-525M reed switch to GND
 
 // ---- Timing ----
@@ -96,6 +109,7 @@ const int       ADC_AVERAGING_SAMPLES = 8;
 
 // ---- Rain gauge ----
 const float    RAIN_GAUGE_MM_PER_TIP = 0.1f;   // TR-525M: 0.1 mm (0.004 in) per tip
+const int      RAIN_HISTORY_HOURS   = 24;     // window for the rain_24h_mm value
 const uint32_t TIP_DEBOUNCE_MS       = 50;     // ignore closures this soon after a counted tip
                                                // (the switch stays closed ~135 ms per tip)
 
@@ -156,6 +170,13 @@ struct RainGauge {
   uint32_t lastTipMs;    // millis() of the most recent tip
 };
 
+// Gauge tips counted in one-hour slots, for a rolling 24-hour total.
+struct RainHistory {
+  uint16_t tipsPerSlot[RAIN_HISTORY_HOURS];
+  int      currentSlot;
+  uint32_t slotStartMs;
+};
+
 // All values in seconds, ready for logging and display.
 struct Durations {
   uint32_t wetFor;       // 0 when dry
@@ -173,10 +194,10 @@ Adafruit_ADS1115 adc;                                               // ADS1115
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R2, U8X8_PIN_NONE);   // RAK1921, rotated 180 degrees
 Adafruit_BME680 airSensor(&Wire);                                   // RAK1906
 SFE_UBLOX_GNSS  gnss;                                               // GPS
-BLEDfu          bleDfu;                                             // over-the-air firmware updates
-BLEUart         bleUart;                                            // log rows over Bluetooth
+BLEClientUart   peripheralUart[MAX_PERIPHERALS];                    // one per connected peripheral
 
 LeafWetness wetness;
+RainHistory rainHistory;          // zero-initialised: empty history, first slot starts at power-on
 
 // Written by the rain gauge interrupt, read with interrupts off (see readRainGauge).
 volatile uint32_t tipCount     = 0;
@@ -415,9 +436,34 @@ Durations computeDurations(const LeafWetness& w, uint32_t nowMs) {
   return d;
 }
 
+// Adds the latest tips to the current hour, moving on to a fresh slot (and
+// forgetting the oldest hour) each time an hour passes.
+void updateRainHistory(RainHistory& h, uint32_t tipsNow, uint32_t nowMs) {
+  const uint32_t HOUR_MS = 3600000UL;
+  while (nowMs - h.slotStartMs >= HOUR_MS) {
+    h.currentSlot = (h.currentSlot + 1) % RAIN_HISTORY_HOURS;
+    h.tipsPerSlot[h.currentSlot] = 0;
+    h.slotStartMs += HOUR_MS;
+  }
+  h.tipsPerSlot[h.currentSlot] += tipsNow;
+}
+
+float rainLast24hMm(const RainHistory& h) {
+  uint32_t tips = 0;
+  for (int i = 0; i < RAIN_HISTORY_HOURS; i++) tips += h.tipsPerSlot[i];
+  return tips * RAIN_GAUGE_MM_PER_TIP;
+}
+
+// Seconds since the RAIN state ended: 0 while it is raining, -1 if it never has.
+long secondsSinceRainStopped(const LeafWetness& w, uint32_t nowMs) {
+  if (!w.everRained)            return -1;
+  if (rainIsActive(w, nowMs))   return 0;
+  return (long)((nowMs - w.lastRainMs - RAIN_HOLD_MS) / 1000);   // RAIN_HOLD_MS after the last signal
+}
+
 
 // =============================================================================
-//  Logging (Serial + SD card + Bluetooth)
+//  Logging (Serial + SD card)
 // =============================================================================
 
 // mv = leaf reading now. above_base_mv = mv minus the dry baseline.
@@ -448,6 +494,22 @@ void formatCsvRow(char* out, size_t outSize, uint32_t nowMs, const UtcTime& utc,
            rainfallMm(gauge), sinceTip);
 }
 
+// "raining,rain_24h_mm,seconds_since_rain_stopped", e.g. "0,2.5,7200".
+void formatBroadcast(char* out, size_t outSize, const LeafWetness& w,
+                     const RainHistory& h, uint32_t nowMs) {
+  snprintf(out, outSize, "%d,%.1f,%ld",
+           w.state == STATE_RAIN ? 1 : 0,
+           rainLast24hMm(h),
+           secondsSinceRainStopped(w, nowMs));
+}
+
+// Sends the line to every peripheral that is connected and has the UART service.
+void broadcastToPeripherals(const char* message) {
+  for (int i = 0; i < MAX_PERIPHERALS; i++) {
+    if (peripheralUart[i].discovered()) peripheralUart[i].println(message);
+  }
+}
+
 // Opens and closes the file on every write so a power cut can't corrupt it.
 bool appendToLogFile(const char* line) {
   File file = SD.open(logFileName, FILE_WRITE);   // FILE_WRITE appends
@@ -459,8 +521,6 @@ bool appendToLogFile(const char* line) {
 
 void logLine(const char* line) {
   DEBUG_PRINTLN(line);
-
-  if (bleUart.notifyEnabled()) bleUart.println(line);
 
   if (sdCardReady && !appendToLogFile(line)) {
     sdCardReady = false;
@@ -487,11 +547,13 @@ void drawDisplay(float leafMv, const AirReading& air, const UtcTime& utc,
 
   oled.clearBuffer();
 
-  // Row 0: wet/dry state, warnings for missing SD card or GPS time
-  snprintf(text, sizeof text, "%s%s%s",
+  // Row 0: wet/dry state, warnings for missing SD card or GPS time, and
+  // P<n> = number of connected Bluetooth peripherals
+  snprintf(text, sizeof text, "%s%s%s P%d",
            stateName(w.state),
            sdCardReady ? "" : " !SD",
-           utc.valid   ? "" : " !GPS");
+           utc.valid   ? "" : " !GPS",
+           (int)Bluefruit.Central.connected());
   drawRow(0, text);
 
   // Row 1: leaf reading and dry baseline
@@ -545,18 +607,31 @@ void drawDisplay(float leafMv, const AirReading& air, const UtcTime& utc,
 //  Bluetooth callbacks
 // =============================================================================
 
-#if DEBUG   // these callbacks only report to Serial
-void onBleConnect(uint16_t connHandle) {
-  (void)connHandle;
-  Serial.println("# BLE connected");
+// Called for every advertising packet seen while scanning. Connects to devices
+// that offer the Nordic UART service, until MAX_PERIPHERALS are connected.
+void onScanReport(ble_gap_evt_adv_report_t* report) {
+  bool hasRoom      = Bluefruit.Central.connected() < MAX_PERIPHERALS;
+  bool offersUart   = Bluefruit.Scanner.checkReportForService(report, peripheralUart[0]);
+  if (hasRoom && offersUart) Bluefruit.Central.connect(report);
+  else                       Bluefruit.Scanner.resume();
 }
 
-void onBleDisconnect(uint16_t connHandle, uint8_t reason) {
+// Connection handles count from 0, so a handle doubles as the slot number.
+void onPeripheralConnect(uint16_t connHandle) {
+  bool slotOk = connHandle < MAX_PERIPHERALS;
+  if (!slotOk || !peripheralUart[connHandle].discover(connHandle)) {
+    Bluefruit.disconnect(connHandle);          // no usable UART service: let go
+    return;
+  }
+  DEBUG_PRINTLN("# BLE peripheral connected");
+  if (Bluefruit.Central.connected() < MAX_PERIPHERALS) Bluefruit.Scanner.start(0);   // look for more
+}
+
+void onPeripheralDisconnect(uint16_t connHandle, uint8_t reason) {
   (void)connHandle;
   (void)reason;
-  Serial.println("# BLE disconnected");
+  DEBUG_PRINTLN("# BLE peripheral disconnected");   // the scanner restarts itself
 }
-#endif
 
 
 // =============================================================================
@@ -640,32 +715,22 @@ void startSdCard() {
 }
 
 void startBluetooth() {
-  // Bandwidth and connection settings must be set before Bluefruit.begin().
-  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
-  Bluefruit.configPrphConn(92, BLE_GAP_EVENT_LENGTH_MIN, 16, 16);
-
-  if (!Bluefruit.begin()) {
+  // 0 peripheral connections (we do not advertise), MAX_PERIPHERALS central ones.
+  if (!Bluefruit.begin(0, MAX_PERIPHERALS)) {
     DEBUG_PRINTLN("# Bluetooth failed to start");
     return;
   }
   Bluefruit.setTxPower(8);
-  Bluefruit.setName(BLE_DEVICE_NAME);
-#if DEBUG
-  Bluefruit.Periph.setConnectCallback(onBleConnect);
-  Bluefruit.Periph.setDisconnectCallback(onBleDisconnect);
-#endif
 
-  bleDfu.begin();
-  bleUart.begin();
+  for (int i = 0; i < MAX_PERIPHERALS; i++) peripheralUart[i].begin();
+  Bluefruit.Central.setConnectCallback(onPeripheralConnect);
+  Bluefruit.Central.setDisconnectCallback(onPeripheralDisconnect);
 
-  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addTxPower();
-  Bluefruit.Advertising.addService(bleUart);
-  Bluefruit.ScanResponse.addName();
-  Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.setInterval(32, 244);
-  Bluefruit.Advertising.setFastTimeout(30);
-  Bluefruit.Advertising.start(0);                     // advertise forever
+  Bluefruit.Scanner.setRxCallback(onScanReport);
+  Bluefruit.Scanner.restartOnDisconnect(true);
+  Bluefruit.Scanner.setInterval(160, 80);              // units of 0.625 ms: scan 50 ms of every 100 ms
+  Bluefruit.Scanner.useActiveScan(false);
+  Bluefruit.Scanner.start(0);                          // scan forever
 }
 
 void setup() {
@@ -703,11 +768,16 @@ void loop() {
   RainGauge  gauge  = readRainGauge();
 
   addSample(wetness, leafMv, gauge.tipsNow, nowMs);
+  updateRainHistory(rainHistory, gauge.tipsNow, nowMs);
   Durations durations = computeDurations(wetness, nowMs);
 
   char row[240];
   formatCsvRow(row, sizeof row, nowMs, utc, leafMv, wetness, air, durations, gauge);
   logLine(row);
+
+  char broadcast[32];
+  formatBroadcast(broadcast, sizeof broadcast, wetness, rainHistory, nowMs);
+  broadcastToPeripherals(broadcast);
 
   drawDisplay(leafMv, air, utc, wetness, durations, gauge, nowMs);
 }

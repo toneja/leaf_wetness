@@ -1,8 +1,8 @@
 # Leaf Wetness Logger
 
-A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, built for vineyard canopy monitoring. It reads the sensor every 10 seconds, works out whether the leaf is wet and *why* (rain, dew, or unknown) from how far and how fast the signal has risen, tracks how long it has been wet, dry, and since the last rain, and logs everything to a microSD card and Bluetooth (and to Serial when `DEBUG` is on), with a live OLED readout. A tipping bucket rain gauge is logged alongside, as ground truth for rain events.
+A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, built for vineyard canopy monitoring. It reads the sensor every 10 seconds, works out whether the leaf is wet and *why* (rain, dew, or unknown) from how far and how fast the signal has risen, tracks how long it has been wet, dry, and since the last rain, and logs everything to a microSD card (and to Serial when `DEBUG` is on) and sends a short rain summary to up to four Bluetooth peripherals, with a live OLED readout. A tipping bucket rain gauge is logged alongside, as ground truth for rain events.
 
-The wetness logic (v8) is deliberately simple: a **level test** against a self-learned dry baseline says whether the leaf is wet, and a **rate test** over the last 10 minutes (plus the rain gauge) says whether water is arriving. It replaces the Binks-style 15-minute-step method of v6/v7, which hid the light-rain events in `WET0003.CSV`. See [How it works](#how-it-works).
+The wetness logic (v8, unchanged in v9) is deliberately simple: a **level test** against a self-learned dry baseline says whether the leaf is wet, and a **rate test** over the last 10 minutes (plus the rain gauge) says whether water is arriving. It replaces the Binks-style 15-minute-step method of v6/v7, which hid the light-rain events in `WET0003.CSV`. See [How it works](#how-it-works).
 
 ## Features
 
@@ -12,10 +12,10 @@ The wetness logic (v8) is deliberately simple: a **level test** against a self-l
 - Air temperature, humidity and dew point from a BME680 (logged for context, not used to classify)
 - Tipping bucket rain gauge (TR-525M) on `WB_IO3`: interrupt-driven tip counting with debounce, logged as tips per sample, running total, rainfall in mm and time since the last tip. A tip also counts as a rain signal for the state logic
 - UTC timestamps from a u-blox GPS (logging starts before a fix; date/time are blank until one arrives)
-- One CSV row per sample, sent to the SD card and Bluetooth UART (and Serial in debug mode)
+- One CSV row per sample, sent to the SD card (and Serial in debug mode)
+- Bluetooth central: connects to up to 4 Nordic UART peripherals and sends each a rain summary line after every sample (see [Bluetooth broadcast](#bluetooth-broadcast))
 - A new SD file on every boot, so earlier logs are never touched
 - 128x64 OLED status display
-- Over-the-air firmware updates (BLE DFU)
 
 ## Status
 
@@ -24,7 +24,7 @@ The wetness logic (v8) is deliberately simple: a **level test** against a self-l
 | ADS1115 + PHYTOS31 | Yes (spray bottle, and a real rain log, `WET0002.CSV`) |
 | Serial output | Yes |
 | GPS timestamps | Yes |
-| Bluetooth UART | Yes |
+| Bluetooth central + broadcast (v9) | Not yet. Compiled and the message values checked in a desktop test build only |
 | Wetness logic (v8) | Replayed offline against `WET0002.CSV` and `WET0003.CSV`; not yet run live on the device |
 | TR-525M rain gauge | Logged live in `WET0003.CSV` (one tip). Tip counting and debounce are also checked in a desktop test build |
 | RAK1921 OLED | Not yet |
@@ -96,7 +96,8 @@ All tunables are at the top of the sketch. Millivolt values are the sensor's out
 | `RAIN_GAUGE_PIN` | `WB_IO3` | Pin the rain gauge reed switch is wired to |
 | `RAIN_GAUGE_MM_PER_TIP` | 0.1 | Rainfall per tip. 0.1 mm for the TR-525M |
 | `TIP_DEBOUNCE_MS` | 50 | Closures this soon after a counted tip are ignored |
-| `BLE_DEVICE_NAME` | `PHYTOS31 LOGGER` | Bluetooth advertising name |
+| `MAX_PERIPHERALS` | 4 | Bluetooth peripherals the logger stays connected to |
+| `RAIN_HISTORY_HOURS` | 24 | Window for the rain total in the broadcast |
 
 **Why `GAIN_TWO`:** the PHYTOS31 can output up to about half its supply (~1.65 V). `GAIN_FOUR` (+/-1.024 V) would clip a fully wet reading.
 
@@ -131,9 +132,9 @@ At power-up the first reading is the baseline. If it is already `WET_ON_MV` or m
 
 `WET0003.CSV` (v7 firmware, about 15 h, 0.1 mm gauge):
 
-- The leaf was dry at 361-364 mV, then rose in a first small step at 06:12 UTC and a fast ramp (+57 mV in 5 minutes) from 06:25, flattening near 505 mV by 07:05. This looks like light rain or drizzle. The gauge recorded nothing, because the total was under one tip.
-- The leaf never dried again. Readings stayed 440-520 mV (80-150 mV above the dry level) for the remaining 14 hours.
-- The only gauge tip was at 09:37, and the leaf had risen about 4 mV a few minutes earlier. A second light event at about 09:30-10:35 raised it a further 20 mV in small 3-5 mV steps.
+- The sensor was installed and booted outdoors in wet conditions. It read a dry 361-364 mV for the first 40 minutes, then rose in a small step at 06:12 UTC and a fast ramp (+57 mV in 5 minutes) from 06:25, flattening near 505 mV by 07:05. This was observed light rain. The gauge recorded nothing for it, because the total was under one 0.1 mm tip.
+- The leaf stayed wet all night and through a cloudy morning. It began drying only when the sun came out near the end of the log (about 17:00-20:50 UTC, 505 to 439 mV) and was still not dry when the log was pulled. So the sustained high reading was real wetness, not a stuck sensor.
+- The only gauge tip was at 09:37 UTC (01:37 local), and the leaf had risen about 4 mV a few minutes earlier. A light event at about 09:30-10:35 raised it a further 20 mV in small 3-5 mV steps.
 - Once wet, the signal moves in discrete steps of a few mV (up when water arrives, down by 10-14 mV when a drop runs off, for example at 13:15-13:25). It is quiet otherwise: the 60-second noise is under 0.2 mV.
 - With the sensor wet, mV correlated with air temperature at -0.83, and the evening decline (505 to 439 mV from 17:00 to 20:50) happens while the air warms. Drying is slow.
 - v7's 15-minute steps averaged the first ramp into one +15.7 mV step, which is below its 100 mV rain threshold, so it was labelled WET, not RAIN, and never ended.
@@ -158,7 +159,7 @@ This is a heuristic from one leaf sensor. It cannot distinguish every case (see 
 
 | Row | Shows | Example |
 |---|---|---|
-| 0 | State, warnings | `RAIN !GPS` |
+| 0 | State, warnings, connected BLE peripherals | `RAIN !GPS P2` |
 | 1 | Leaf reading and baseline, in mV | `542 mV base 354` |
 | 2 | Temp, RH, dew point | `14.2C 95% dp13.5` |
 | 3 | Time wet or dry | `Wet for 1h 12m` |
@@ -167,9 +168,28 @@ This is a heuristic from one leaf sensor. It cannot distinguish every case (see 
 
 Warnings on row 0: `!SD` means the SD card is missing or a write failed, `!GPS` means no valid GPS time yet.
 
-### Serial, SD card and Bluetooth
+### Serial and SD card
 
-Each sample produces one CSV row. Serial (debug builds only) prints the header at boot, and Bluetooth sends rows only (no header). Every boot starts a **new SD file** (`WET0001.CSV`, `WET0002.CSV`, ...) with the header as its first line; existing files are never appended to. In debug builds the chosen name is printed on Serial at startup (`# Logging to WET0003.CSV`). File names use the 8.3 format so they work with any SD library. Lines starting with `#` on Serial are status messages, not data.
+Each sample produces one CSV row. Serial (debug builds only) prints the header at boot. Every boot starts a **new SD file** (`WET0001.CSV`, `WET0002.CSV`, ...) with the header as its first line; existing files are never appended to. In debug builds the chosen name is printed on Serial at startup (`# Logging to WET0003.CSV`). File names use the 8.3 format so they work with any SD library. Lines starting with `#` on Serial are status messages, not data.
+
+### Bluetooth broadcast
+
+The logger is a BLE **central**: it scans for devices that offer the Nordic UART service, connects to up to `MAX_PERIPHERALS` (4) of them, and after every sample writes each one a single line (10 s apart by default):
+
+```
+raining,rain_24h_mm,seconds_since_rain_stopped
+0,2.5,7200
+```
+
+| Field | Meaning |
+|---|---|
+| `raining` | `1` while the state is `RAIN`, otherwise `0` |
+| `rain_24h_mm` | Rain gauge total over the last 24 hours, in 0.1 mm steps. Counts from power-on if the logger has run for less than 24 hours. The window is in whole hours, so it covers 23-24 hours. |
+| `seconds_since_rain_stopped` | `0` while raining. Once `RAIN` ends (30 minutes after the last rain signal) it counts up. `-1` if no rain has been seen since power-on. |
+
+The example means: not raining, 2.5 mm in the past 24 hours, rain stopped 2 hours ago. The rain total comes from the gauge only, which cannot see drizzle under 0.1 mm, so light leaf-sensor rain events will show `raining = 1` without adding to the total.
+
+Because the logger is a central it no longer advertises, so it cannot be reached by a phone, and **BLE firmware updates (DFU) and the old UART row stream are gone**. Upload over USB.
 
 ## CSV reference
 
@@ -252,7 +272,7 @@ print(daily_wet_hours)
 - **Rain gauge counts are since boot.** A reset sets `tips_total` and `rain_mm` back to zero. A bucket that has not yet tipped holds some water, so the log lags the actual rain by up to 0.1 mm and by the time the next tip takes.
 - **No real-time clock.** Durations and `uptime_s` restart at every reset, and so do the baseline and totals. Rows only carry real dates once the GPS has a fix.
 - **One sensor cannot always separate dew, fog, drizzle and irrigation.** The `state` column is a best guess from the rate of rise.
-- **The leaf may look wet long after the rain ended.** In `WET0003.CSV` the sensor stayed 80-150 mV above its dry level for 14 hours. Whether the surface was still wet is unknown (a sensor held at 45 degrees can retain drops that a leaf would shed). A hand wipe of the sensor, and a note of the time, would show what the reading does on a truly dry surface.
+- **Wet surfaces dry slowly.** In `WET0003.CSV` the sensor stayed 80-150 mV above its dry level for 14 hours of dark, cloudy, humid weather, and only started to dry in sun.
 - **The gauge cannot see light rain.** A tip needs 0.1 mm, and a dry funnel absorbs some water first, so drizzle may never tip. Light events in `WET0003.CSV` were visible only on the leaf sensor.
 - **Rain thresholds are estimates.** Only one tip exists to confirm a rain signal, so most of the small-step events are unconfirmed.
 - **A sensor is not a leaf.** Thermal mass, angle and exposure differ, and drops run off a tilted sensor, so onset and drying times will not match your canopy exactly. Mount it at leaf angle in the canopy.
@@ -267,12 +287,13 @@ print(daily_wet_hours)
 | OLED shows `# ADS1115 not found` (and Serial repeats it when `DEBUG` is 1) | ADC wiring, power on 3V3_S, I2C address `0x48`. The sketch stops until the ADC is found. |
 | `# RAK1906 not found` | Module seated in its slot. Logging continues with `nan` air values. |
 | `# GPS not found` | Module and I2C wiring. Logging continues with blank date/time. |
-| `# SD card not found` / `!SD` on OLED | Card seated and FAT-formatted. Logging continues on Bluetooth (and Serial in debug builds). |
+| `# SD card not found` / `!SD` on OLED | Card seated and FAT-formatted. Logging continues on Serial in debug builds. |
 | `# No free log file name on SD card` | All 9999 file names are used. Archive or delete old `WET*.CSV` files. |
 | Blank or upside-down OLED | `U8G2_R2` rotates 180 degrees (use `U8G2_R0` for the other way). Confirm the I2C address and module. |
 | State stuck on `DRY` during rain | Check `above_base_mv` and `rise10m_mv`. Wetting needs `WET_ON_MV` above baseline; light rain that never gets there stays `DRY` but still logs `rain_sig`. |
 | State stuck on a wet state for hours | Normal after rain: it ends only when `above_base_mv` falls below `WET_OFF_MV`. If the sensor has not truly dried, the baseline may also be stale: restart to re-learn it on a dry sensor. |
 | `tips_total` stays 0 in rain | Switch wiring (WB_IO3 and GND), and that the funnel is level and unblocked. Short the two leads together and confirm a tip is counted. |
+| Peripheral never connects | It must advertise the Nordic UART service. `P<n>` on OLED row 0 is the number connected (max 4). |
 | `!GPS` never clears | GPS needs a clear sky view. Allow several minutes for a first fix. |
 
 ## Roadmap

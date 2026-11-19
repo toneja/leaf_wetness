@@ -2,7 +2,7 @@
 
 A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, built for vineyard canopy monitoring. It reads the sensor every 10 seconds, works out whether the leaf is wet and *why* (rain, dew, or unknown) from how far and how fast the signal has risen, tracks how long it has been wet, dry, and since the last rain, and logs everything to a microSD card (and to Serial when `DEBUG` is on) and sends a short rain summary to up to four Bluetooth peripherals, with a live OLED readout. A tipping bucket rain gauge is logged alongside, as ground truth for rain events.
 
-The wetness logic (v8, unchanged in v9) is deliberately simple: a **level test** against a self-learned dry baseline says whether the leaf is wet, and a **rate test** over the last 10 minutes (plus the rain gauge) says whether water is arriving. It replaces the Binks-style 15-minute-step method of v6/v7, which hid the light-rain events in `WET0003.CSV`. See [How it works](#how-it-works).
+The wetness logic (v8, extended in v10) is deliberately simple: a **level test** against a self-learned dry baseline says whether the leaf is wet, and a **rate test** over the last 10 minutes (plus how much the reading is jumping about, and the rain gauge) says whether water is arriving. It replaces the Binks-style 15-minute-step method of v6/v7, which hid the light-rain events in `WET0003.CSV`. See [How it works](#how-it-works).
 
 ## Features
 
@@ -11,7 +11,7 @@ The wetness logic (v8, unchanged in v9) is deliberately simple: a **level test**
 - Wet duration, dry duration, time since last rain, and cumulative wet time
 - Air temperature, humidity and dew point from a BME680 (logged for context, not used to classify)
 - Tipping bucket rain gauge (TR-525M) on `WB_IO3`: interrupt-driven tip counting with debounce, logged as tips per sample, running total, rainfall in mm and time since the last tip. A tip also counts as a rain signal for the state logic
-- UTC timestamps from a u-blox GPS (logging starts before a fix; date/time are blank until one arrives)
+- UTC timestamps from a u-blox GPS on every row: startup blocks until the GPS has the date and time, and the OLED shows `Waiting for GPS fix` with the satellite count and time waited
 - One CSV row per sample, sent to the SD card (and Serial in debug mode)
 - Bluetooth central: connects to up to 4 Nordic UART peripherals and sends each a rain summary line after every sample (see [Bluetooth broadcast](#bluetooth-broadcast))
 - A new SD file on every boot, so earlier logs are never touched
@@ -25,7 +25,8 @@ The wetness logic (v8, unchanged in v9) is deliberately simple: a **level test**
 | Serial output | Yes |
 | GPS timestamps | Yes |
 | Bluetooth central + broadcast (v9) | Not yet. Compiled and the message values checked in a desktop test build only |
-| Wetness logic (v8) | Replayed offline against `WET0002.CSV` and `WET0003.CSV`; not yet run live on the device |
+| Wetness logic (v8) | Run live on the device: `WET0003.CSV` and `WET0011.CSV` (65 gauge tips, 6.5 mm) |
+| Activity rain signal and GPS wait (v10) | Replayed offline against three logs; GPS wait checked in a desktop test build only, not yet run live |
 | TR-525M rain gauge | Logged live in `WET0003.CSV` (one tip). Tip counting and debounce are also checked in a desktop test build |
 | RAK1921 OLED | Not yet |
 | microSD logging | Not yet |
@@ -92,6 +93,7 @@ All tunables are at the top of the sketch. Millivolt values are the sensor's out
 | `DRY_FALLBACK_MV` | 350 | Baseline if the logger powers up on an already wet leaf |
 | `RISE_WINDOW_SAMPLES` | 60 | Window for the rate test (60 x 10 s = 10 min) |
 | `RAIN_RISE_MV` | 4 | A rise this big within the window counts as rain |
+| `RAIN_ACTIVITY_MV` | 0.5 | Average sample-to-sample change over the window that counts as rain |
 | `RAIN_HOLD_MS` | 30 min | Rain stays "active" this long after the last signal |
 | `RAIN_GAUGE_PIN` | `WB_IO3` | Pin the rain gauge reed switch is wired to |
 | `RAIN_GAUGE_MM_PER_TIP` | 0.1 | Rainfall per tip. 0.1 mm for the TR-525M |
@@ -101,7 +103,7 @@ All tunables are at the top of the sketch. Millivolt values are the sensor's out
 
 **Why `GAIN_TWO`:** the PHYTOS31 can output up to about half its supply (~1.65 V). `GAIN_FOUR` (+/-1.024 V) would clip a fully wet reading.
 
-**Check the thresholds against your own data.** `RAIN_RISE_MV` and the wet thresholds were chosen from two logs (`WET0002.CSV`, `WET0003.CSV`) with no independent rain record for most of the light events, so treat them as a first estimate. The `rain_sig` and `rise10m_mv` columns exist so you can re-tune them offline.
+**Check the thresholds against your own data.** `RAIN_RISE_MV`, `RAIN_ACTIVITY_MV` and the wet thresholds were chosen from three logs. Only `WET0011.CSV` has a gauge record that covers the rain it contains, so treat them as a good starting point, not a calibration. The `rain_sig`, `rise10m_mv` and `activity_mv` columns exist so you can re-tune them offline.
 
 ## How it works
 
@@ -113,7 +115,13 @@ The **baseline** is the dry level. While the leaf is dry it creeps along with sl
 
 ### Is water arriving? (rate test)
 
-If the reading has risen by `RAIN_RISE_MV` or more over the last 10 minutes, or the gauge tipped, that sample is a **rain signal** (`rain_sig` column). Dew and temperature drift change far more slowly than that. Each signal restarts `since_rain_s`, and rain is "active" for `RAIN_HOLD_MS` after the last one.
+A sample is a **rain signal** (`rain_sig` column) if any of these is true:
+
+- the reading has risen by `RAIN_RISE_MV` or more over the last 10 minutes;
+- the reading has been jumping about: its average change between consecutive samples over 10 minutes (`activity_mv`) is at least `RAIN_ACTIVITY_MV`. This catches steady or heavy rain on an already wet sensor, where the level has stopped rising but drops keep landing and running off;
+- the gauge tipped.
+
+Dew, temperature drift and drying are far slower and smoother than that. Each signal restarts `since_rain_s`, and rain is "active" for `RAIN_HOLD_MS` after the last one.
 
 ### States
 
@@ -141,6 +149,16 @@ At power-up the first reading is the baseline. If it is already `WET_ON_MV` or m
 
 Replaying v8 on this log: DRY to RAIN at 06:26 UTC (back-dated to 06:12), then candidate rain signals at 08:06, 09:31, 11:33, 12:30 and 14:45. The 08:06, 11:33, 12:30 and 14:45 signals are single steps of 3-5 mV and **have no independent confirmation**, so they may be light rain or may be droplet movement or temperature. On `WET0002.CSV` (heavy rain) v8 detects wetting at 22:03 UTC, with the first rain signal at about 21:41.
 
+`WET0011.CSV` (v8 firmware, about 10 h, 65 tips = 6.5 mm) is the first log with a gauge record that covers real rain:
+
+- **Event 1, from about 06:36 UTC.** The leaf rose from 364 to 560 mV in about an hour as the first 1.4 mm fell, then stayed at 560 mV through the lull. The first tip (06:55) came about 20 minutes after the leaf began to climb.
+- **Lull, about 08:30-09:50.** The gauge was silent and the leaf flat at 560 mV, with 1.2 hours and no false rain signals. Wet, rain-free leaf noise is under 0.1 mV.
+- **Event 2, from about 09:55.** The leaf crept up 16 mV about 40 minutes before the next tip (10:34), which looks like light rain that was too little for the gauge. Heavy rain followed from about 11:30 to 15:30 (51 tips, tips every 2-5 minutes).
+- **The reading is not capped at 560 mV.** It rose to 650-680 mV in the heaviest rain, so more water on the sensor means a higher reading.
+- **Every tip fell inside a RAIN period**, and the state ended RAIN 30 minutes after the last signal. The longest gap between rain signals inside an event was 27 minutes (the end of event 1), which is why `RAIN_HOLD_MS` is 30 minutes.
+- **Leaf activity tracks rain rate.** Per 10 minutes, `activity_mv` averaged 0.5 mV with no tips, 0.9 with one tip, about 2 with two or three tips, and 3.4 with four or five (correlation 0.75). That is why v10 uses it as a rain signal, and it may later give a rain-rate estimate finer than the gauge's 0.1 mm.
+- **No other signal was needed for detection.** Replaying v10 on this log gives the same RAIN/WET periods as v8: DRY to RAIN at 06:46, RAIN to WET at 08:57, WET to RAIN at 09:55. The activity signal fills gaps (steady rain, and a falling reading during run-off) and changes the older logs: it extends WET0003's first RAIN period to 07:55, and finds a second rain period at 01:33 UTC in `WET0002.CSV`, where the reading dropped 33 mV in 10 minutes.
+
 ### Rain gauge
 
 Each tip of the bucket closes a reed switch, which pulls `WB_IO3` low. A falling-edge interrupt counts it, ignoring any closure within `TIP_DEBOUNCE_MS` of the last counted tip. According to the LI-COR and Campbell Scientific documentation for this gauge, the switch stays closed for about 135 ms per tip and bounces for under 1 ms, so counting only the falling edge and a 50 ms window gives one count per tip. Every 10-second row logs the tips since the previous row, the running total (and rainfall in mm), and the seconds since the last tip.
@@ -166,7 +184,9 @@ This is a heuristic from one leaf sensor. It cannot distinguish every case (see 
 | 4 | Time since rain was last detected (leaf rise or gauge tip) | `Rain 4h 10m ago` |
 | 5 | Rain gauge total and time since its last tip | `Gauge 12.3mm 4m 05s` |
 
-Warnings on row 0: `!SD` means the SD card is missing or a write failed, `!GPS` means no valid GPS time yet.
+Warnings on row 0: `!SD` means the SD card is missing or a write failed, `!GPS` means the GPS has lost its time since startup.
+
+While waiting for the GPS at startup the display shows `Waiting for GPS fix`, the number of satellites in view, and how long it has been waiting. Nothing is logged until the fix arrives.
 
 ### Serial and SD card
 
@@ -194,7 +214,7 @@ Because the logger is a central it no longer advertises, so it cannot be reached
 ## CSV reference
 
 ```
-date,time,uptime_s,mv,state,baseline_mv,above_base_mv,rise10m_mv,rain_sig,wet_dur_s,since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c,tips,tips_total,rain_mm,since_tip_s
+date,time,uptime_s,mv,state,baseline_mv,above_base_mv,rise10m_mv,activity_mv,rain_sig,wet_dur_s,since_wet_s,since_rain_s,wet_total_s,temp_c,rh_pct,dewpt_c,tips,tips_total,rain_mm,since_tip_s
 ```
 
 Rows come every 10 seconds and every column is decided at that rate. `tips` is rain gauge tips since the previous row.
@@ -204,45 +224,40 @@ Rows come every 10 seconds and every column is decided at that rate. `tips` is r
 Dry leaf, GPS time available:
 
 ```
-2026-11-17,05:50:07,280,361.4,DRY,361.5,-0.1,0.0,0,0,0,0,0,14.9,59.0,7.1,0,0,0.0,0
+2026-11-18,05:55:50,370,363.6,DRY,363.6,0.0,0.0,0.01,0,0,0,0,0,10.6,66.2,4.6,0,0,0.0,0
 ```
 
-Rain signal from the leaf, about two minutes into the first ramp:
+The first gauge tip of the rain in `WET0011.CSV` (leaf and gauge both signal rain):
 
 ```
-2026-11-17,06:27:46,2560,403.0,RAIN,363.6,39.4,32.5,1,92,0,10,92,12.7,62.1,5.2,0,0,0.0,0
-```
-
-No GPS fix yet (date and time are empty):
-
-```
-,,42,361.3,DRY,361.3,0.0,0.0,0,0,0,0,0,15.4,57.9,7.0,0,0,0.0,0
+2026-11-18,06:55:49,3850,453.4,RAIN,364.3,89.1,76.9,1.47,3,750,0,0,750,10.0,61.2,2.8,1,1,0.1,1
 ```
 
 ### Columns
 
 | # | Column | Unit | Description |
 |---|---|---|---|
-| 1 | `date` | `YYYY-MM-DD` | UTC date from the GPS. Empty until the GPS has a valid fix. |
-| 2 | `time` | `HH:MM:SS` | UTC time from the GPS. Empty until the GPS has a valid fix. |
+| 1 | `date` | `YYYY-MM-DD` | UTC date from the GPS. Empty only if the GPS loses its time after startup. |
+| 2 | `time` | `HH:MM:SS` | UTC time from the GPS. Empty only if the GPS loses its time after startup. |
 | 3 | `uptime_s` | s | Seconds since power-on. Always present. Wraps after about 49.7 days. |
 | 4 | `mv` | mV | PHYTOS31 output at ADS1115 A0, average of 8 reads. The live measurement. |
 | 5 | `state` | text | `DRY`, `DEW`, `RAIN` or `WET`. Updated every sample. |
 | 6 | `baseline_mv` | mV | The dry level. Follows slow drift while dry; frozen while wet or while rain is active. |
 | 7 | `above_base_mv` | mV | `mv` minus `baseline_mv`. The level the wet test uses. |
 | 8 | `rise10m_mv` | mV | `mv` minus the reading 10 minutes earlier. The rate the rain test uses. |
-| 9 | `rain_sig` | 0-3 | Rain signal this sample: 1 = leaf rise reached `RAIN_RISE_MV`, 2 = gauge tip, 3 = both, 0 = none. |
-| 10 | `wet_dur_s` | s | Length of the current wet period, back-dated to when the signal began leaving the baseline. 0 when dry. |
-| 11 | `since_wet_s` | s | Time since the last wet period ended. 0 while wet or if the leaf has never been wet since boot. |
-| 12 | `since_rain_s` | s | Time since the last rain signal. 0 means none has been seen since boot. |
-| 13 | `wet_total_s` | s | Total wet time since boot, including the current wet period. |
-| 14 | `temp_c` | degC | Air temperature from the BME680 (inside the enclosure). `nan` if the sensor is missing. |
-| 15 | `rh_pct` | %RH | Relative humidity from the BME680. `nan` if the sensor is missing. |
-| 16 | `dewpt_c` | degC | Dew point (Magnus formula) from the two values above. `nan` if the sensor is missing. |
-| 17 | `tips` | count | Rain gauge tips since the previous row (normally 10 s earlier). |
-| 18 | `tips_total` | count | Tips since power-on. |
-| 19 | `rain_mm` | mm | `tips_total` x 0.1 mm. Rainfall since power-on. |
-| 20 | `since_tip_s` | s | Seconds since the last counted tip. 0 if there has been none since boot (check `tips_total`). |
+| 9 | `activity_mv` | mV | Average absolute change between consecutive samples over the last 10 minutes. The jumpiness the rain test uses. |
+| 10 | `rain_sig` | 0-3 | Rain signal this sample: 1 = leaf (rise reached `RAIN_RISE_MV` or activity reached `RAIN_ACTIVITY_MV`), 2 = gauge tip, 3 = both, 0 = none. |
+| 11 | `wet_dur_s` | s | Length of the current wet period, back-dated to when the signal began leaving the baseline. 0 when dry. |
+| 12 | `since_wet_s` | s | Time since the last wet period ended. 0 while wet or if the leaf has never been wet since boot. |
+| 13 | `since_rain_s` | s | Time since the last rain signal. 0 means none has been seen since boot. |
+| 14 | `wet_total_s` | s | Total wet time since boot, including the current wet period. |
+| 15 | `temp_c` | degC | Air temperature from the BME680 (inside the enclosure). `nan` if the sensor is missing. |
+| 16 | `rh_pct` | %RH | Relative humidity from the BME680. `nan` if the sensor is missing. |
+| 17 | `dewpt_c` | degC | Dew point (Magnus formula) from the two values above. `nan` if the sensor is missing. |
+| 18 | `tips` | count | Rain gauge tips since the previous row (normally 10 s earlier). |
+| 19 | `tips_total` | count | Tips since power-on. |
+| 20 | `rain_mm` | mm | `tips_total` x 0.1 mm. Rainfall since power-on. |
+| 21 | `since_tip_s` | s | Seconds since the last counted tip. 0 if there has been none since boot (check `tips_total`). |
 
 ### Reading the columns together
 
@@ -270,7 +285,8 @@ print(daily_wet_hours)
 ## Limitations
 
 - **Rain gauge counts are since boot.** A reset sets `tips_total` and `rain_mm` back to zero. A bucket that has not yet tipped holds some water, so the log lags the actual rain by up to 0.1 mm and by the time the next tip takes.
-- **No real-time clock.** Durations and `uptime_s` restart at every reset, and so do the baseline and totals. Rows only carry real dates once the GPS has a fix.
+- **No real-time clock.** Durations and `uptime_s` restart at every reset, and so do the baseline and totals. Real dates come from the GPS, and startup waits for it.
+- **No GPS, no logging.** Startup blocks until the GPS has the date and time, so a missing or blocked antenna stops the logger after boot.
 - **One sensor cannot always separate dew, fog, drizzle and irrigation.** The `state` column is a best guess from the rate of rise.
 - **Wet surfaces dry slowly.** In `WET0003.CSV` the sensor stayed 80-150 mV above its dry level for 14 hours of dark, cloudy, humid weather, and only started to dry in sun.
 - **The gauge cannot see light rain.** A tip needs 0.1 mm, and a dry funnel absorbs some water first, so drizzle may never tip. Light events in `WET0003.CSV` were visible only on the leaf sensor.
@@ -286,7 +302,7 @@ print(daily_wet_hours)
 |---|---|
 | OLED shows `# ADS1115 not found` (and Serial repeats it when `DEBUG` is 1) | ADC wiring, power on 3V3_S, I2C address `0x48`. The sketch stops until the ADC is found. |
 | `# RAK1906 not found` | Module seated in its slot. Logging continues with `nan` air values. |
-| `# GPS not found` | Module and I2C wiring. Logging continues with blank date/time. |
+| `# GPS not found` | Module and I2C wiring. The logger stops with this message, because every row needs a timestamp. |
 | `# SD card not found` / `!SD` on OLED | Card seated and FAT-formatted. Logging continues on Serial in debug builds. |
 | `# No free log file name on SD card` | All 9999 file names are used. Archive or delete old `WET*.CSV` files. |
 | Blank or upside-down OLED | `U8G2_R2` rotates 180 degrees (use `U8G2_R0` for the other way). Confirm the I2C address and module. |
@@ -294,7 +310,7 @@ print(daily_wet_hours)
 | State stuck on a wet state for hours | Normal after rain: it ends only when `above_base_mv` falls below `WET_OFF_MV`. If the sensor has not truly dried, the baseline may also be stale: restart to re-learn it on a dry sensor. |
 | `tips_total` stays 0 in rain | Switch wiring (WB_IO3 and GND), and that the funnel is level and unblocked. Short the two leads together and confirm a tip is counted. |
 | Peripheral never connects | It must advertise the Nordic UART service. `P<n>` on OLED row 0 is the number connected (max 4). |
-| `!GPS` never clears | GPS needs a clear sky view. Allow several minutes for a first fix. |
+| Stuck on `Waiting for GPS fix` | The GPS needs a clear sky view. Check the satellite count on the display, and allow several minutes for a first fix. |
 
 ## Roadmap
 
@@ -306,10 +322,10 @@ print(daily_wet_hours)
 
 ## References
 
-- Binks, O., Carle, H., Coughlin, I., da Costa, A. L., & Meir, P. (2021). [Measuring the vertical profile of leaf wetness in a forest canopy](https://pmc.ncbi.nlm.nih.gov/articles/PMC8374337). *MethodsX* 8:101332. (v6/v7 followed this paper; v8 does not.)
+- Binks, O., Carle, H., Coughlin, I., da Costa, A. L., & Meir, P. (2021). [Measuring the vertical profile of leaf wetness in a forest canopy](https://pmc.ncbi.nlm.nih.gov/articles/PMC8374337). *MethodsX* 8:101332. (v6/v7 followed this paper; v8 onwards does not.)
 - Kleb, M., Merkt, N., & Zorb, C. (2022). [New Aspects of In Situ Measurements for Downy Mildew Forecasting](https://www.mdpi.com/2223-7747/11/14/1807/htm). *Plants* 11(14):1807.
 - Sentelhas, P. C., et al. (2005). [Spatial variability of leaf wetness duration in different crop canopies](https://ippc2.orst.edu/len/articles_canopy_conversion/sentelhas_etal_2005_full.pdf). *Int. J. Biometeorology* 49:363-370.
 
 ## License
 
-Add a license of your choice (MIT is a common default for hardware/Arduino projects).
+MIT License

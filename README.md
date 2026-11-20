@@ -93,7 +93,8 @@ All tunables are at the top of the sketch. Millivolt values are the sensor's out
 | `DRY_FALLBACK_MV` | 350 | Baseline if the logger powers up on an already wet leaf |
 | `RISE_WINDOW_SAMPLES` | 60 | Window for the rate test (60 x 10 s = 10 min) |
 | `RAIN_RISE_MV` | 4 | A rise this big within the window counts as rain |
-| `RAIN_ACTIVITY_MV` | 0.5 | Average sample-to-sample change over the window that counts as rain |
+| `ZIGZAG_SAMPLES` | 6 | Samples in the zig-zag window (6 x 10 s = 1 minute). Short on purpose, so the signal stops soon after the rain does |
+| `RAIN_ACTIVITY_MV` | 0.3 | Zig-zag per sample over that minute that counts as rain (see `activity_mv`) |
 | `RAIN_HOLD_MS` | 30 min | Rain stays "active" this long after the last signal |
 | `RAIN_GAUGE_PIN` | `WB_IO3` | Pin the rain gauge reed switch is wired to |
 | `RAIN_GAUGE_MM_PER_TIP` | 0.1 | Rainfall per tip. 0.1 mm for the TR-525M |
@@ -118,7 +119,7 @@ The **baseline** is the dry level. While the leaf is dry it creeps along with sl
 A sample is a **rain signal** (`rain_sig` column) if any of these is true:
 
 - the reading has risen by `RAIN_RISE_MV` or more over the last 10 minutes;
-- the reading has been jumping about: its average change between consecutive samples over 10 minutes (`activity_mv`) is at least `RAIN_ACTIVITY_MV`. This catches steady or heavy rain on an already wet sensor, where the level has stopped rising but drops keep landing and running off;
+- the reading has been zig-zagging: over the last minute, the distance it travelled minus its net change, per sample (`activity_mv`), is at least `RAIN_ACTIVITY_MV`. This catches steady or heavy rain on an already wet sensor, where the level has stopped rising but drops keep landing and running off. A smooth rise or fall, such as a leaf drying quickly indoors, scores zero;
 - the gauge tipped.
 
 Dew, temperature drift and drying are far slower and smoother than that. Each signal restarts `since_rain_s`, and rain is "active" for `RAIN_HOLD_MS` after the last one.
@@ -156,8 +157,8 @@ Replaying v8 on this log: DRY to RAIN at 06:26 UTC (back-dated to 06:12), then c
 - **Event 2, from about 09:55.** The leaf crept up 16 mV about 40 minutes before the next tip (10:34), which looks like light rain that was too little for the gauge. Heavy rain followed from about 11:30 to 15:30 (51 tips, tips every 2-5 minutes).
 - **The reading is not capped at 560 mV.** It rose to 650-680 mV in the heaviest rain, so more water on the sensor means a higher reading.
 - **Every tip fell inside a RAIN period**, and the state ended RAIN 30 minutes after the last signal. The longest gap between rain signals inside an event was 27 minutes (the end of event 1), which is why `RAIN_HOLD_MS` is 30 minutes.
-- **Leaf activity tracks rain rate.** Per 10 minutes, `activity_mv` averaged 0.5 mV with no tips, 0.9 with one tip, about 2 with two or three tips, and 3.4 with four or five (correlation 0.75). That is why v10 uses it as a rain signal, and it may later give a rain-rate estimate finer than the gauge's 0.1 mm.
-- **No other signal was needed for detection.** Replaying v10 on this log gives the same RAIN/WET periods as v8: DRY to RAIN at 06:46, RAIN to WET at 08:57, WET to RAIN at 09:55. The activity signal fills gaps (steady rain, and a falling reading during run-off) and changes the older logs: it extends WET0003's first RAIN period to 07:55, and finds a second rain period at 01:33 UTC in `WET0002.CSV`, where the reading dropped 33 mV in 10 minutes.
+- **Leaf activity tracks rain rate.** Per 10 minutes, the average change between samples (the first version of `activity_mv`) was 0.4 mV with no tips, 0.9 with one tip, about 2 with two or three tips, and 3.4 with four or five (correlation 0.75). The zig-zag version used in v10 correlates just as well (0.76, measured over 10-minute windows) but ignores smooth trends, which is why v10 uses it as a rain signal, and it may later give a rain-rate estimate finer than the gauge's 0.1 mm.
+- **No other signal was needed for detection.** Replaying v10 on this log gives the same RAIN/WET periods as v8: DRY to RAIN at 06:46, RAIN to WET at 08:57, WET to RAIN at 09:55. The activity signal fills gaps (steady rain, and a falling reading during run-off) and changes the older logs: it extends WET0003's first RAIN period to 07:53, and finds extra, unconfirmed RAIN periods there at 12:25 and 15:30, and no longer treats the smooth 33 mV fall at 01:33 UTC in `WET0002.CSV` as rain.
 
 ### Rain gauge
 
@@ -197,7 +198,7 @@ Each sample produces one CSV row. Serial (debug builds only) prints the header a
 The logger is a BLE **central**: it scans for devices that offer the Nordic UART service, connects to up to `MAX_PERIPHERALS` (4) of them, and after every sample writes each one a single line (10 s apart by default):
 
 ```
-raining,rain_24h_mm,seconds_since_rain_stopped
+raining,rain_24h_mm,seconds_since_last_rain
 0,2.5,7200
 ```
 
@@ -205,9 +206,9 @@ raining,rain_24h_mm,seconds_since_rain_stopped
 |---|---|
 | `raining` | `1` while the state is `RAIN`, otherwise `0` |
 | `rain_24h_mm` | Rain gauge total over the last 24 hours, in 0.1 mm steps. Counts from power-on if the logger has run for less than 24 hours. The window is in whole hours, so it covers 23-24 hours. |
-| `seconds_since_rain_stopped` | `0` while raining. Once `RAIN` ends (30 minutes after the last rain signal) it counts up. `-1` if no rain has been seen since power-on. |
+| `seconds_since_last_rain` | Seconds since the last rain signal (leaf or gauge), the same value as `since_rain_s` in the CSV and the OLED. It keeps counting while `raining` is still 1, because rain stays "active" for `RAIN_HOLD_MS` after the last signal. `-1` if no rain has been seen since power-on. |
 
-The example means: not raining, 2.5 mm in the past 24 hours, rain stopped 2 hours ago. The rain total comes from the gauge only, which cannot see drizzle under 0.1 mm, so light leaf-sensor rain events will show `raining = 1` without adding to the total.
+The example means: not raining, 2.5 mm in the past 24 hours, last rain signal 2 hours ago. The rain total comes from the gauge only, which cannot see drizzle under 0.1 mm, so light leaf-sensor rain events will show `raining = 1` without adding to the total.
 
 Because the logger is a central it no longer advertises, so it cannot be reached by a phone, and **BLE firmware updates (DFU) and the old UART row stream are gone**. Upload over USB.
 
@@ -245,7 +246,7 @@ The first gauge tip of the rain in `WET0011.CSV` (leaf and gauge both signal rai
 | 6 | `baseline_mv` | mV | The dry level. Follows slow drift while dry; frozen while wet or while rain is active. |
 | 7 | `above_base_mv` | mV | `mv` minus `baseline_mv`. The level the wet test uses. |
 | 8 | `rise10m_mv` | mV | `mv` minus the reading 10 minutes earlier. The rate the rain test uses. |
-| 9 | `activity_mv` | mV | Average absolute change between consecutive samples over the last 10 minutes. The jumpiness the rain test uses. |
+| 9 | `activity_mv` | mV | Zig-zag over the last minute: the distance the reading travelled minus its net change, divided by the 5 steps. 0 for a smooth rise or fall. The test uses this for rain. |
 | 10 | `rain_sig` | 0-3 | Rain signal this sample: 1 = leaf (rise reached `RAIN_RISE_MV` or activity reached `RAIN_ACTIVITY_MV`), 2 = gauge tip, 3 = both, 0 = none. |
 | 11 | `wet_dur_s` | s | Length of the current wet period, back-dated to when the signal began leaving the baseline. 0 when dry. |
 | 12 | `since_wet_s` | s | Time since the last wet period ended. 0 while wet or if the leaf has never been wet since boot. |
@@ -310,6 +311,8 @@ print(daily_wet_hours)
 | State stuck on a wet state for hours | Normal after rain: it ends only when `above_base_mv` falls below `WET_OFF_MV`. If the sensor has not truly dried, the baseline may also be stale: restart to re-learn it on a dry sensor. |
 | `tips_total` stays 0 in rain | Switch wiring (WB_IO3 and GND), and that the funnel is level and unblocked. Short the two leads together and confirm a tip is counted. |
 | Peripheral never connects | It must advertise the Nordic UART service. `P<n>` on OLED row 0 is the number connected (max 4). |
+| Last field of the Bluetooth line stays 0 after rain | It reads 0 for `RAIN_HOLD_MS` (30 minutes) after the last rain signal. For bench tests set `RAIN_HOLD_MS` to 2 minutes. The leaf signal itself clears within about a minute of the last drop landing (`ZIGZAG_SAMPLES`), but the 10-minute rise test can hold on for up to 10 minutes after a rise. |
+| Receiver shows 4294967295 for "no rain yet" | The logger sends `-1`. Store that field in a signed variable (`long` or `int32_t`) on the receiver, and compare with the `# BLE tx:` line the logger prints to Serial (`DEBUG 1`). |
 | Stuck on `Waiting for GPS fix` | The GPS needs a clear sky view. Check the satellite count on the display, and allow several minutes for a first fix. |
 
 ## Roadmap

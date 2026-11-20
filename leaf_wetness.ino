@@ -23,9 +23,9 @@
 
     "Is water arriving?" Rate test. Any of these counts as a rain signal:
                            - the reading rose by RAIN_RISE_MV or more in 10 minutes
-                           - the reading has been jumping about: its average
-                             sample-to-sample change over 10 minutes is at least
-                             RAIN_ACTIVITY_MV (drops landing and running off)
+                           - the reading has been zig-zagging: over the last minute
+                             it has moved at least RAIN_ACTIVITY_MV per sample more
+                             than its net change (drops landing and running off)
                            - the rain gauge tipped
                          Dew and temperature drift are far slower and smoother
                          than that. Rain stays "active" for RAIN_HOLD_MS after
@@ -54,9 +54,12 @@
     raining                1 while the state is RAIN, otherwise 0
     rain_24h_mm            gauge rainfall over the last 24 hours (since power-on
                            if the logger has run for less than that)
-    seconds_since_rain_stopped
-                           0 while raining, counting up once RAIN ends;
-                           -1 if no rain has been seen since power-on
+    seconds_since_last_rain
+                           seconds since the last rain signal (the same value as
+                           since_rain_s in the CSV and the OLED); -1 if no rain
+                           has been seen since power-on. It keeps counting while
+                           raining is still 1, because RAIN stays active for
+                           RAIN_HOLD_MS after the last signal.
 
   GPS: startup waits (showing a message on the OLED) until the GPS has the date
   and time, so every row has a timestamp. Durations still use the internal clock.
@@ -128,7 +131,8 @@ const float DRY_FALLBACK_MV = 350.0f;    // baseline if the logger powers up on 
 // ---- Is water arriving? (rate test) ----
 const int RISE_WINDOW_SAMPLES = 60;              // 60 x 10 s = 10 minutes
 const float RAIN_RISE_MV = 4.0f;                 // rise within the window that counts as rain
-const float RAIN_ACTIVITY_MV = 0.5f;             // mean change per sample over the window that counts as rain
+const int ZIGZAG_SAMPLES = 6;                    // 6 x 10 s = 1 minute: how recent the zig-zag must be
+const float RAIN_ACTIVITY_MV = 0.3f;             // zig-zag per sample over that minute that counts as rain
 const uint32_t RAIN_HOLD_MS = 30UL * 60 * 1000;  // rain stays "active" this long after the last signal
 
 
@@ -145,7 +149,7 @@ struct LeafWetness {
   WetState state = STATE_DRY;
   float baselineMv = 0;    // dry level
   float riseMv = 0;        // change over the last RISE_WINDOW_SAMPLES samples
-  float activityMv = 0;    // average sample-to-sample change over that window
+  float activityMv = 0;    // zig-zag per sample over the last minute (movement beyond the net change)
   uint8_t rainSignal = 0;  // this sample: bit 0 = leaf (rise or activity), bit 1 = gauge tip
   bool wet = false;
   bool everWet = false;
@@ -386,17 +390,22 @@ bool rainIsActive(const LeafWetness& w, uint32_t nowMs) {
   return w.everRained && (nowMs - w.lastRainMs) < RAIN_HOLD_MS;
 }
 
-// How much the reading has been moving about: the average absolute change
-// between consecutive samples across the window. Rain keeps it above about
-// 0.5 mV; a wet but rain-free leaf stays under 0.1 mV.
+// How much the reading has been zig-zagging over the last minute: the distance
+// it travelled minus its net change, averaged per sample. Drops landing and
+// running off make it jump up and down, which gives 0.3 mV or more in rain.
+// A smooth rise or fall, such as a leaf drying, travels exactly as far as its
+// net change, so it scores zero however fast it moves. The window is short on
+// purpose: a longer one would keep reporting rain for minutes after it stopped.
 float windowActivity(const LeafWetness& w) {
-  float total = 0;
-  for (int i = 1; i < RISE_WINDOW_SAMPLES; i++) {
-    float older = w.history[(w.historyNext + i - 1) % RISE_WINDOW_SAMPLES];  // historyNext = oldest
-    float newer = w.history[(w.historyNext + i) % RISE_WINDOW_SAMPLES];
-    total += fabs(newer - older);
+  int newest = (w.historyNext + RISE_WINDOW_SAMPLES - 1) % RISE_WINDOW_SAMPLES;
+  float travelled = 0;
+  for (int i = 0; i < ZIGZAG_SAMPLES - 1; i++) {
+    float later = w.history[(newest - i + RISE_WINDOW_SAMPLES) % RISE_WINDOW_SAMPLES];
+    float earlier = w.history[(newest - i - 1 + RISE_WINDOW_SAMPLES) % RISE_WINDOW_SAMPLES];
+    travelled += fabs(later - earlier);
   }
-  return total / (RISE_WINDOW_SAMPLES - 1);
+  float first = w.history[(newest - (ZIGZAG_SAMPLES - 1) + RISE_WINDOW_SAMPLES) % RISE_WINDOW_SAMPLES];
+  return (travelled - fabs(w.history[newest] - first)) / (ZIGZAG_SAMPLES - 1);
 }
 
 WetState chooseState(const LeafWetness& w, uint32_t nowMs) {
@@ -478,11 +487,10 @@ float rainLast24hMm(const RainHistory& h) {
   return tips * RAIN_GAUGE_MM_PER_TIP;
 }
 
-// Seconds since the RAIN state ended: 0 while it is raining, -1 if it never has.
-long secondsSinceRainStopped(const LeafWetness& w, uint32_t nowMs) {
+// Seconds since the last rain signal (leaf or gauge), or -1 if none since power-on.
+long secondsSinceLastRain(const LeafWetness& w, uint32_t nowMs) {
   if (!w.everRained) return -1;
-  if (rainIsActive(w, nowMs)) return 0;
-  return (long)((nowMs - w.lastRainMs - RAIN_HOLD_MS) / 1000);  // RAIN_HOLD_MS after the last signal
+  return (long)((nowMs - w.lastRainMs) / 1000);
 }
 
 
@@ -491,8 +499,8 @@ long secondsSinceRainStopped(const LeafWetness& w, uint32_t nowMs) {
 // =============================================================================
 
 // mv = leaf reading now. above_base_mv = mv minus the dry baseline.
-// rise10m_mv = change over the last 10 minutes. activity_mv = average
-// sample-to-sample change over the same time. rain_sig: 0 none, 1 leaf,
+// rise10m_mv = change over the last 10 minutes. activity_mv =
+// zig-zag over the last minute (see windowActivity). rain_sig: 0 none, 1 leaf,
 // 2 gauge tip, 3 both. tips = gauge tips since the previous row; tips_total and
 // rain_mm count from power-on.
 const char* CSV_HEADER =
@@ -519,13 +527,13 @@ void formatCsvRow(char* out, size_t outSize, uint32_t nowMs, const UtcTime& utc,
            rainfallMm(gauge), sinceTip);
 }
 
-// "raining,rain_24h_mm,seconds_since_rain_stopped", e.g. "0,2.5,7200".
+// "raining,rain_24h_mm,seconds_since_last_rain", e.g. "0,2.5,7200".
 void formatBroadcast(char* out, size_t outSize, const LeafWetness& w,
                      const RainHistory& h, uint32_t nowMs) {
   snprintf(out, outSize, "%d,%.1f,%ld",
            w.state == STATE_RAIN ? 1 : 0,
            rainLast24hMm(h),
-           secondsSinceRainStopped(w, nowMs));
+           secondsSinceLastRain(w, nowMs));
 }
 
 // Sends the line to every peripheral that is connected and has the UART service.
@@ -827,6 +835,8 @@ void loop() {
   char broadcast[32];
   formatBroadcast(broadcast, sizeof broadcast, wetness, rainHistory, nowMs);
   broadcastToPeripherals(broadcast);
+  DEBUG_PRINT("# BLE tx: ");
+  DEBUG_PRINTLN(broadcast);
 
   drawDisplay(leafMv, air, utc, wetness, durations, gauge, nowMs);
 }

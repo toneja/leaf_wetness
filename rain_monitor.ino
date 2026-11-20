@@ -1,6 +1,13 @@
 /*
-  Leaf wetness logger, v10
-  -----------------------
+  Rain monitor
+  ------------
+  Detects and measures rainfall and tracks leaf wetness, to record the
+  conditions that favour fungal disease spread in a vineyard. Rain comes from two
+  sources that back each other up: a tipping bucket gauge (millimetres, but only
+  in 0.1 mm steps) and a leaf wetness sensor (responds to the lightest rain and
+  drizzle, but gives no millimetres). Each sample is logged to SD, shown on the
+  OLED, and summarised to Bluetooth peripherals.
+
   Hardware : RAK4631 core, PHYTOS31 leaf wetness sensor read through an
              Adafruit ADS1115 16-bit ADC, RAK1906 (BME680), RAK1921 OLED,
              RAK15002 microSD, u-blox GNSS module (I2C),
@@ -13,7 +20,7 @@
     ADS1115   VDD -> 3V3_S,  GND -> GND,  SDA/SCL -> the WisBlock I2C bus (address 0x48)
     TR-525M   one reed switch lead -> WB_IO3,  the other -> GND  (polarity does not matter)
 
-  How the leaf is judged (two separate questions, both answered every 10 s):
+  How rain and wetness are judged (two separate questions, both answered every 10 s):
 
     "Is the leaf wet?"   Level test. The sensor reading is compared with a dry
                          baseline that the sketch learns for itself. Wet when it
@@ -49,7 +56,7 @@
   Nordic UART service, connects to up to MAX_PERIPHERALS of them, and after every
   sample sends each one a single line:
 
-      raining,rain_24h_mm,seconds_since_rain_stopped      e.g.  0,2.5,7200
+      raining,rain_24h_mm,seconds_since_last_rain      e.g.  0,2.5,7200
 
     raining                1 while the state is RAIN, otherwise 0
     rain_24h_mm            gauge rainfall over the last 24 hours (since power-on
@@ -99,8 +106,8 @@
 // ---- Pins, addresses and names ----
 const int SENSOR_POWER_PIN = WB_IO2;      // enables the 3V3_S power rail
 const uint8_t BME680_I2C_ADDRESS = 0x76;  // RAK1906
-// Each boot starts a new log file: WET0001.CSV, WET0002.CSV, ... (8.3 names work on any SD library).
-const char* LOG_FILE_PATTERN = "WET%04d.CSV";
+// Each boot starts a new log file: RAIN0001.CSV, RAIN0002.CSV, ... (8.3 names work on any SD library).
+const char* LOG_FILE_PATTERN = "RAIN%04d.CSV";
 const int MAX_LOG_FILES = 9999;
 const int MAX_PERIPHERALS = 4;      // BLE devices the logger will stay connected to
 const int RAIN_GAUGE_PIN = WB_IO3;  // TR-525M reed switch to GND

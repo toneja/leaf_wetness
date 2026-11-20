@@ -1,11 +1,19 @@
-# Leaf Wetness Logger
+# Rain Monitor
 
-A WisBlock (RAK4631) datalogger for the METER **PHYTOS31** leaf wetness sensor, built for vineyard canopy monitoring. It reads the sensor every 10 seconds, works out whether the leaf is wet and *why* (rain, dew, or unknown) from how far and how fast the signal has risen, tracks how long it has been wet, dry, and since the last rain, and logs everything to a microSD card (and to Serial when `DEBUG` is on) and sends a short rain summary to up to four Bluetooth peripherals, with a live OLED readout. A tipping bucket rain gauge is logged alongside, as ground truth for rain events.
+A WisBlock (RAK4631) rainfall logger and monitor for vineyard disease-risk work. It records when it rains, how much, and how long the leaf surface stays wet, using two sources that cover each other's gaps:
 
-The wetness logic (v8, extended in v10) is deliberately simple: a **level test** against a self-learned dry baseline says whether the leaf is wet, and a **rate test** over the last 10 minutes (plus how much the reading is jumping about, and the rain gauge) says whether water is arriving. It replaces the Binks-style 15-minute-step method of v6/v7, which hid the light-rain events in `WET0003.CSV`. See [How it works](#how-it-works).
+- a **TR-525M tipping bucket rain gauge**, which measures rainfall in millimetres but only in 0.1 mm steps, so it cannot see drizzle;
+- a METER **PHYTOS31 leaf wetness sensor**, which responds to the lightest rain and tells you whether the leaf is wet, but gives no millimetres.
+
+Every 10 seconds it combines them to decide whether it is raining, tracks time since the last rain and the 24-hour rainfall, logs a row to a microSD card (and to Serial when `DEBUG` is on), updates a live OLED readout, and sends a short rain summary to up to four Bluetooth peripherals.
+
+The rain and wetness logic (v8, extended in v10) is deliberately simple: a **level test** against a self-learned dry baseline says whether the leaf is wet, and a **rate test** (a rise over 10 minutes, how much the reading is zig-zagging over the last minute, and the rain gauge) says whether water is arriving. It replaces the Binks-style 15-minute-step method of v6/v7, which hid the light-rain events in `WET0003.CSV`. See [How it works](#how-it-works).
+
+> **History:** this project was the "Leaf Wetness Logger" through versions 1-10 (`leaf_wetness_v2` ... `leaf_wetness_v10`). The sketch is now `rain_monitor/rain_monitor.ino`, the old versions are in `archive/`, and SD log files are named `RAINnnnn.CSV` instead of `WETnnnn.CSV`. The CSV columns did not change. Logs quoted below (`WET0002`, `WET0003`, `WET0011`) were written by earlier firmware under the old name.
 
 ## Features
 
+- Rain detection from both the leaf sensor (light rain and drizzle) and the tipping bucket gauge (amounts), with time since last rain and a rolling 24-hour rainfall total
 - 16-bit leaf wetness measurement through an Adafruit ADS1115, in millivolts of sensor output
 - Wet/dry from the sensor's height above a dry baseline it learns itself (no calibration endpoints), and rain from a rise of a few mV in 10 minutes or a gauge tip: **RAIN**, **WET** (rain stopped, leaf still wet), **DEW** (wet with no rain seen), **DRY**
 - Wet duration, dry duration, time since last rain, and cumulative wet time
@@ -73,7 +81,7 @@ The reed switch has no polarity. The sketch turns on the pin's internal pull-up,
    - SparkFun u-blox GNSS Arduino Library
 
    `SD.h`, `Wire.h` and `bluefruit.h` come with the BSP.
-3. Put the sketch in a folder with the same name as the `.ino` file (an Arduino requirement), open it, and upload.
+3. Open `rain_monitor/rain_monitor.ino` (the folder must keep the same name as the `.ino` file, an Arduino requirement) and upload.
 4. With `#define DEBUG 1` (the default), open the Serial monitor at **115200 baud**. The sketch waits up to 3 seconds for it to connect. For deployment set `#define DEBUG 0` near the top of the sketch: Serial is then never started or used, and none of the status messages exist in the build.
 
 ## Configuration
@@ -191,7 +199,7 @@ While waiting for the GPS at startup the display shows `Waiting for GPS fix`, th
 
 ### Serial and SD card
 
-Each sample produces one CSV row. Serial (debug builds only) prints the header at boot. Every boot starts a **new SD file** (`WET0001.CSV`, `WET0002.CSV`, ...) with the header as its first line; existing files are never appended to. In debug builds the chosen name is printed on Serial at startup (`# Logging to WET0003.CSV`). File names use the 8.3 format so they work with any SD library. Lines starting with `#` on Serial are status messages, not data.
+Each sample produces one CSV row. Serial (debug builds only) prints the header at boot. Every boot starts a **new SD file** (`RAIN0001.CSV`, `RAIN0002.CSV`, ...) with the header as its first line; existing files are never appended to. In debug builds the chosen name is printed on Serial at startup (`# Logging to WET0003.CSV`). File names use the 8.3 format so they work with any SD library. Lines starting with `#` on Serial are status messages, not data.
 
 ### Bluetooth broadcast
 
@@ -274,7 +282,7 @@ The first gauge tip of the rain in `WET0011.CSV` (leaf and gauge both signal rai
 ```python
 import pandas as pd
 
-df = pd.read_csv("WET0001.CSV", parse_dates={"timestamp": ["date", "time"]})
+df = pd.read_csv("RAIN0001.CSV", parse_dates={"timestamp": ["date", "time"]})
 df = df.dropna(subset=["timestamp"]).set_index("timestamp")
 
 interval_h = 10 / 3600                      # SAMPLE_INTERVAL_MS in hours
